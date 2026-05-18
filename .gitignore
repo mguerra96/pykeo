@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Pipeline data — large, downloaded/generated at runtime
+tec_data/
+results/
+network/station_rnx/
+network/station_map/
+
+# Logs and run summaries
+*.log
+pipeline_log_*.csv
+
+# Claude Code local settings
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

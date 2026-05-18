@@ -1,0 +1,16 @@
+$years = 2018, 2019, 2020, 2021
+
+foreach ($y in $years) {
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host "  Starting orchestrator for year $y"
+    Write-Host "============================================================"
+    python scripts\orchestrator.py --year $y
+    if (-not $?) {
+        Write-Host "Year $y failed - stopping queue." -ForegroundColor Red
+        exit 1
+    }
+}
+
+Write-Host ""
+Write-Host "All years completed." -ForegroundColor Green
