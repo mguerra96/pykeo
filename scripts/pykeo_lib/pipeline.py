@@ -154,6 +154,39 @@ def process_station(
         return ("error", obs_paths)
 
 
+def _drop_jumpy_svs(df_sat_coords: pl.DataFrame, max_step_m: float = 500_000.0) -> pl.DataFrame:
+    """
+    Drop every SV whose interpolated orbit has a jump > max_step_m between
+    consecutive 30 s epochs. Catches corrupt broadcast records that survive
+    upstream sanitization (e.g. R13 on 2017-01-03, where a garbled 20:45 nav
+    message produced ~20 000 km position discontinuities).
+
+    Sat coords are in metres; nominal GLONASS step at 30 s sampling is ~90 km,
+    so 500 km is ~5× nominal — well below any plausible discontinuity.
+    """
+    if df_sat_coords.is_empty():
+        return df_sat_coords
+    df = df_sat_coords.sort(["sv", "epoch"])
+    step_sq = sum(
+        (pl.col(c) - pl.col(c).shift(1).over("sv")) ** 2
+        for c in ("sat_x", "sat_y", "sat_z")
+    )
+    flagged = (
+        df.with_columns(step_sq.sqrt().alias("_step"))
+        .filter(pl.col("_step").is_finite() & (pl.col("_step") > max_step_m))
+        .get_column("sv")
+        .unique()
+        .to_list()
+    )
+    if not flagged:
+        return df_sat_coords
+    logger.warning(
+        f"Dropping {len(flagged)} SV(s) with orbit jumps > {max_step_m / 1000:g} km: "
+        f"{sorted(flagged)}"
+    )
+    return df_sat_coords.filter(~pl.col("sv").is_in(flagged))
+
+
 def _group_obs_by_station(obs_files: list[Path]) -> dict[str, list[Path]]:
     """
     Group obs files by 4-char station code.
@@ -283,6 +316,7 @@ def run(
         f"Sat coords computed: {len(df_sat_coords):,} rows "
         f"({len(svs_all)} SVs × {len(epochs_grid)} epochs)"
     )
+    df_sat_coords = _drop_jumpy_svs(df_sat_coords)
 
     station_groups = list(station_files.values())
     n_workers      = min(12, len(station_groups))

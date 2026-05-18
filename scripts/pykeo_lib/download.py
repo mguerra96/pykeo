@@ -241,6 +241,29 @@ def ensure_nav(year: int, doy: int, nav_dir: Path) -> list[Path]:
     return nav_files
 
 
+def _sanitize_glonass(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Drop corrupt GLONASS broadcast records.
+
+    The 3rd header field (parsed as `clock_drift_rate`) is the message frame
+    time. Legitimate values are at most a few × 10^5 seconds; uninitialized
+    records carry the ~2^32 sentinel (≈ 4.29e9). The empirical gap between
+    valid and sentinel is ~4 × 10^9, so 10^8 is a safe threshold.
+    """
+    if df.is_empty() or "clock_drift_rate" not in df.columns:
+        return df
+    SENTINEL_THRESHOLD = 1e8
+    n_in = len(df)
+    df = df.filter(
+        (pl.col("clock_drift_rate").abs() < SENTINEL_THRESHOLD)
+        | pl.col("clock_drift_rate").is_null()
+    )
+    n_dropped = n_in - len(df)
+    if n_dropped:
+        logger.warning(f"GLONASS NAV sanitizer dropped {n_dropped} corrupt record(s)")
+    return df
+
+
 def merge_nav_dicts(nav_dicts: list[dict]) -> dict:
     """Merge multiple navigation dictionaries keyed by GNSS constellation."""
     merged: dict[str, pl.DataFrame] = {}
@@ -252,4 +275,6 @@ def merge_nav_dicts(nav_dicts: list[dict]) -> dict:
                 ).unique()
             else:
                 merged[constellation] = df
+    if "GLONASS" in merged:
+        merged["GLONASS"] = _sanitize_glonass(merged["GLONASS"])
     return merged
