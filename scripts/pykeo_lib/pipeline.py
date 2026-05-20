@@ -34,6 +34,7 @@ from .constants import (
     SG_ORDER,
     SG_WINDOW,
     SYSTEMS,
+    VTEC_JUMP_THRESHOLD,
 )
 from .download import (
     _date_to_year_doy,
@@ -43,6 +44,17 @@ from .download import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _level_vtec_jumps(df: pl.DataFrame, threshold: float = VTEC_JUMP_THRESHOLD) -> pl.DataFrame:
+    """Per-arc: when |vtec[t+1] - vtec[t]| > threshold, shift the post-jump segment by -diff so it aligns with the pre-jump level."""
+    if df.is_empty() or "vtec" not in df.columns or "id_arc_valid" not in df.columns:
+        return df
+    df = df.sort(["id_arc_valid", "epoch"])
+    diff = pl.col("vtec").diff().over("id_arc_valid")
+    jump = pl.when(diff.abs() > threshold).then(diff).otherwise(0.0)
+    correction = jump.fill_null(0.0).cum_sum().over("id_arc_valid")
+    return df.with_columns((pl.col("vtec") - correction).alias("vtec"))
 
 
 def _savitzky_golay_detrend(
@@ -142,6 +154,11 @@ def process_station(
             min_elevation=pipeline_kwargs.get("min_elevation", MIN_ELEVATION),
         )
         df_tec = calculate_tec(df_final, ctx=ctx)
+
+        df_tec = _level_vtec_jumps(
+            df_tec,
+            threshold=pipeline_kwargs.get("vtec_jump_threshold", VTEC_JUMP_THRESHOLD),
+        )
 
         df_out = _savitzky_golay_detrend(df_tec)
 

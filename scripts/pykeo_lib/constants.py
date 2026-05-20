@@ -15,13 +15,16 @@ MIN_ELEVATION = 20        # degrees
 
 # Arc validity thresholds
 ARC_THRESHOLD_ABS  = 1    # TECU
-ARC_THRESHOLD_STD  = 10   # TECU
+ARC_THRESHOLD_STD  = 5   # TECU
 ARC_THRESHOLD_JUMP = 1    # TECU
 ARC_MIN_LENGTH     = 190  # epochs
 ARC_MAX_GAP        = dt.timedelta(minutes=2)
 
 # GNSS constellations
 SYSTEMS = ["G", "E", "R", "C"]
+
+# vTEC consecutive-epoch jump leveling (applied per arc after calibration)
+VTEC_JUMP_THRESHOLD = 0.5  # TECU
 
 # Savitzky-Golay detrending
 SG_WINDOW = 181
