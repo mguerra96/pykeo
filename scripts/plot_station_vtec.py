@@ -1,21 +1,24 @@
 """
 Debug helper: plot elevation / STEC / VTEC / dTEC time series for a single station
-on a given day (4 stacked subplots sharing the time axis).
+on a given day (4 stacked subplots sharing the time axis) as an interactive HTML file.
 
 Usage:
-    python scripts/plot_station_vtec.py <YYYY-MM-DD> [--save PATH]
+    python scripts/plot_station_vtec.py <YYYY-MM-DD> [--save PATH.html]
 
 The script lists all stations available in the parquet for that day and
 prompts the user to pick one interactively. Lines are colored per arc id;
 hover shows the arc id, clicking a legend entry toggles the arc across all
-three panels.
+four panels.
 """
 
 import argparse
+import tempfile
+import webbrowser
 from pathlib import Path
 
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TEC_DIR      = _PROJECT_ROOT / "results" / "tec_data"
@@ -29,8 +32,6 @@ def load_day(date_str: str) -> pd.DataFrame:
 
 
 def list_stations(df: pd.DataFrame) -> list[str]:
-    # Station code is the first underscore-delimited token of id_arc_valid
-    # (e.g. "mate_G05_0" or "MATE_G05_0"). Normalize to upper-case for display.
     codes = df["id_arc_valid"].dropna().str.split("_").str[0].str.upper().unique()
     return sorted(codes)
 
@@ -67,7 +68,6 @@ def prompt_station(stations: list[str]) -> list[str]:
         if bad:
             print(f"Invalid choice(s): {bad}")
             continue
-        # de-dup while preserving order
         seen: set[str] = set()
         unique = [s for s in picked if not (s in seen or seen.add(s))]
         return unique
@@ -75,7 +75,6 @@ def prompt_station(stations: list[str]) -> list[str]:
 
 def filter_station(df: pd.DataFrame, station: str) -> pd.DataFrame:
     station_up = station.upper()
-    # id_arc_valid may use upper- or lower-case station codes — match case-insensitively.
     prefix = df["id_arc_valid"].str.split("_").str[0].str.upper()
     sub = df.loc[prefix == station_up].copy()
     if sub.empty:
@@ -90,145 +89,86 @@ _PANELS = [
     ("vtec_detrended",  "dTEC (TECU)"),
 ]
 
+# Plotly "Light24" palette — 24 distinguishable colors, good for many arcs
+_PALETTE = [
+    "#FD3216", "#00FE35", "#6A76FC", "#FED4C4", "#FE00CE", "#0DF9FF",
+    "#F6F926", "#FF9616", "#479B55", "#EEA6FB", "#DC587D", "#D626FF",
+    "#6E899C", "#00B5F7", "#B68E00", "#C9FBE5", "#FF0092", "#22FFA7",
+    "#E3EE9E", "#86CE00", "#BC7196", "#7E7DCD", "#FC6955", "#E48F72",
+]
 
-def plot(df: pd.DataFrame, station: str, date_str: str, save: Path | None) -> None:
+
+def plot_html(df: pd.DataFrame, station: str, date_str: str) -> None:
     missing = [c for c, _ in _PANELS if c not in df.columns]
     if missing:
         raise KeyError(f"Columns missing in parquet: {missing}")
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
-
     arc_ids = list(df["id_arc_valid"].dropna().unique())
-    cmap = plt.get_cmap("tab20")
-    color_map = {aid: cmap(i % cmap.N) for i, aid in enumerate(arc_ids)}
+    color_map = {aid: _PALETTE[i % len(_PALETTE)] for i, aid in enumerate(arc_ids)}
 
-    # arc_id -> list of Line2D (one per panel, same order as _PANELS)
-    arc_lines: dict[str, list] = {aid: [] for aid in arc_ids}
+    fig = make_subplots(
+        rows=len(_PANELS), cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=[label for _, label in _PANELS],
+    )
 
     for arc_id, g in df.groupby("id_arc_valid", sort=False):
         color = color_map[arc_id]
-        for ax, (col, _label) in zip(axes, _PANELS):
-            (line,) = ax.plot(
-                g["epoch"], g[col],
-                color=color, linewidth=1.0, alpha=0.85,
-                label=arc_id, picker=5,
+        for row, (col, _label) in enumerate(_PANELS, start=1):
+            fig.add_trace(
+                go.Scattergl(
+                    x=g["epoch"], y=g[col],
+                    mode="markers",
+                    name=arc_id,
+                    legendgroup=arc_id,
+                    showlegend=(row == 1),
+                    marker=dict(color=color, size=3),
+                    hovertemplate=f"<b>{arc_id}</b><br>%{{x}}<br>%{{y:.3f}}<extra></extra>",
+                ),
+                row=row, col=1,
             )
-            arc_lines[arc_id].append(line)
 
-    for ax, (_col, ylabel) in zip(axes, _PANELS):
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+    for row, (_col, ylabel) in enumerate(_PANELS, start=1):
+        fig.update_yaxes(title_text=ylabel, row=row, col=1, gridcolor="lightgray")
+        fig.update_xaxes(gridcolor="lightgray", row=row, col=1)
 
-    axes[0].set_title(f"{station.upper()} — {date_str}")
-    axes[-1].set_xlabel("Time (UTC)")
+    fig.update_xaxes(title_text="Time (UTC)", row=len(_PANELS), col=1)
 
-    # Single legend on the right of the figure, shared across panels
-    legend_handles = [arc_lines[aid][0] for aid in arc_ids]
-    leg = fig.legend(
-        legend_handles, arc_ids,
-        loc="center left", bbox_to_anchor=(0.88, 0.5),
-        fontsize=7, ncol=1, frameon=False,
+    fig.update_layout(
+        title=f"{station.upper()} — {date_str}",
+        height=1800,
+        hovermode="closest",
+        legend=dict(
+            title="arc id",
+            font=dict(size=9),
+            itemclick="toggle",
+            itemdoubleclick="toggleothers",
+        ),
+        plot_bgcolor="white",
+        margin=dict(l=70, r=180, t=70, b=50),
     )
 
-    fig.autofmt_xdate()
-    fig.tight_layout(rect=(0, 0, 0.87, 1))
+    plot_div = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{station.upper()} — {date_str}</title>"
+        "<style>html,body{margin:0;padding:0;overflow:auto;}"
+        ".plot-wrap{width:100%;height:1800px;}</style>"
+        "</head><body>"
+        f"<div class='plot-wrap'>{plot_div}</div>"
+        "</body></html>"
+    )
 
-    if save is not None:
-        fig.savefig(save, dpi=150, bbox_inches="tight")
-        print(f"Saved: {save}")
-        return
-
-    _attach_hover_tooltip(fig, axes, arc_lines)
-    _attach_legend_toggle(fig, leg, arc_lines)
-    print("Interactive: hover for arc id, click legend entry to toggle visibility.")
-    plt.show()
-
-
-def _attach_hover_tooltip(fig, axes, arc_lines: dict) -> None:
-    """Per-axes annotation showing the arc_id of the line under the cursor."""
-    annots = {}
-    for ax in axes:
-        ann = ax.annotate(
-            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
-            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.95),
-            fontsize=8, zorder=10,
-        )
-        ann.set_visible(False)
-        annots[ax] = ann
-
-    # Reverse index: per-axis dict of arc_id -> Line2D for fast hit testing
-    axis_arc_lines = {ax: {} for ax in axes}
-    for aid, lines in arc_lines.items():
-        for ax, line in zip(axes, lines):
-            axis_arc_lines[ax][aid] = line
-
-    def hide_all():
-        changed = False
-        for ann in annots.values():
-            if ann.get_visible():
-                ann.set_visible(False)
-                changed = True
-        if changed:
-            fig.canvas.draw_idle()
-
-    def on_move(event):
-        ax = event.inaxes
-        if ax not in annots:
-            hide_all()
-            return
-        hit_label = None
-        for label, line in axis_arc_lines[ax].items():
-            if not line.get_visible():
-                continue
-            contains, _ = line.contains(event)
-            if contains:
-                hit_label = label
-                break
-        # hide all other panels' tooltips
-        for other_ax, ann in annots.items():
-            if other_ax is not ax and ann.get_visible():
-                ann.set_visible(False)
-        ann = annots[ax]
-        if hit_label is None:
-            if ann.get_visible():
-                ann.set_visible(False)
-                fig.canvas.draw_idle()
-            return
-        ann.xy = (event.xdata, event.ydata)
-        ann.set_text(hit_label)
-        ann.set_visible(True)
-        fig.canvas.draw_idle()
-
-    fig.canvas.mpl_connect("motion_notify_event", on_move)
-
-
-def _attach_legend_toggle(fig, leg, arc_lines: dict) -> None:
-    """Click a legend entry to hide/show the arc across all panels."""
-    legline_to_label = {}
-    for legline, label in zip(leg.get_lines(), arc_lines.keys()):
-        legline.set_picker(True)
-        legline.set_pickradius(5)
-        legline_to_label[legline] = label
-
-    def on_pick(event):
-        legline = event.artist
-        label = legline_to_label.get(legline)
-        if label is None:
-            return
-        lines = arc_lines[label]
-        visible = not lines[0].get_visible()
-        for line in lines:
-            line.set_visible(visible)
-        legline.set_alpha(1.0 if visible else 0.2)
-        fig.canvas.draw_idle()
-
-    fig.canvas.mpl_connect("pick_event", on_pick)
+    tmp = Path(tempfile.mkstemp(prefix=f"vtec_{date_str}_{station.upper()}_", suffix=".html")[1])
+    tmp.write_text(html, encoding="utf-8")
+    webbrowser.open(tmp.resolve().as_uri())
+    print(f"Opened in browser (temp file: {tmp})")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Plot elevation / STEC / VTEC time series for one station on one day.")
+    p = argparse.ArgumentParser(description="Plot elevation / STEC / VTEC / dTEC time series for one station as interactive HTML.")
     p.add_argument("date", help="Date YYYY-MM-DD")
-    p.add_argument("--save", type=Path, default=None, help="Output image path (otherwise show interactively)")
     args = p.parse_args()
 
     df_all = load_day(args.date)
@@ -243,10 +183,7 @@ def main() -> None:
         print(f"{station} {args.date}: {len(df):,} rows, "
               f"{df['sv'].nunique()} SVs, {df['id_arc_valid'].nunique()} arcs")
 
-        save_path: Path | None = args.save
-        if save_path is not None and len(picks) > 1:
-            save_path = save_path.with_name(f"{save_path.stem}_{station}{save_path.suffix}")
-        plot(df, station, args.date, save_path)
+        plot_html(df, station, args.date)
 
 
 if __name__ == "__main__":

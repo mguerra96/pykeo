@@ -141,9 +141,18 @@ def process_station(
             ~pl.col("sv").str.starts_with("R") | pl.col("sv").is_in(known_glonass)
         )
 
-        df_lc   = calculate_linear_combinations(df_obs, ctx=ctx)
+        df_lc = calculate_linear_combinations(df_obs, ctx=ctx)
+
+        df_sat_coords = pl.read_parquet(sat_coords_path)
+        df_coords = df_sat_coords.join(df_lc.select(["sv", "epoch"]), on=["sv", "epoch"], how="inner")
+        df_geom   = df_lc.join(df_coords, on=["sv", "epoch"], how="left")
+        df_ipp    = calculate_ipp(
+            df_geom, ctx=ctx,
+            min_elevation=pipeline_kwargs.get("min_elevation", MIN_ELEVATION),
+        )
+
         df_arcs = extract_arcs(
-            df=df_lc,
+            df=df_ipp,
             ctx=ctx,
             threshold_abs=pipeline_kwargs.get("arc_threshold_abs", ARC_THRESHOLD_ABS),
             threshold_std=pipeline_kwargs.get("arc_threshold_std", ARC_THRESHOLD_STD),
@@ -152,14 +161,7 @@ def process_station(
             max_gap=pipeline_kwargs.get("arc_max_gap", ARC_MAX_GAP),
         )
 
-        df_sat_coords = pl.read_parquet(sat_coords_path)
-        df_coords = df_sat_coords.join(df_arcs.select(["sv", "epoch"]), on=["sv", "epoch"], how="inner")
-        df_geom   = df_arcs.join(df_coords, on=["sv", "epoch"], how="left")
-        df_final  = calculate_ipp(
-            df_geom, ctx=ctx,
-            min_elevation=pipeline_kwargs.get("min_elevation", MIN_ELEVATION),
-        )
-        df_tec = calculate_tec(df_final, ctx=ctx)
+        df_tec = calculate_tec(df_arcs, ctx=ctx)
 
         df_tec = _level_vtec_jumps(
             df_tec,
@@ -295,7 +297,7 @@ def run(
             fallback_year=_fallback_for(d),
         )
     download_elapsed = time.perf_counter() - t_download
-    logger.warning(f"Download completed in {download_elapsed:.0f}s")
+    logger.info(f"Download completed in {download_elapsed:.0f}s")
 
     t_process = time.perf_counter()
     year, doy = _date_to_year_doy(input_date)
@@ -411,5 +413,5 @@ def run(
     merged = pl.concat(frames).sort(["epoch", "sv"])
     processing_elapsed = time.perf_counter() - t_process
     logger.info(f"Pipeline done: {len(merged):,} rows from {len(frames)} stations")
-    logger.warning(f"Processing completed in {processing_elapsed:.0f}s for DOY {doy:03d} ({input_date})")
+    logger.info(f"Calibration completed in {processing_elapsed:.0f}s for DOY {doy:03d} ({input_date})")
     return merged

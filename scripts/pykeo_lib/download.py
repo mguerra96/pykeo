@@ -43,10 +43,10 @@ def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
             ftp.cwd(remote_dir)
             return [Path(f).name for f in ftp.nlst()]
     except ftplib.error_perm as e:
-        logger.error(f"FTP listing failed {host}{remote_dir}: {e}")
+        logger.debug(f"FTP listing failed {host}{remote_dir}: {e}")
         return []
     except Exception as e:
-        logger.error(f"FTP listing failed {host}{remote_dir}: {e}")
+        logger.debug(f"FTP listing failed {host}{remote_dir}: {e}")
         return []
 
 
@@ -56,7 +56,7 @@ def _list_ftp_dir_failover(hosts: tuple[str, ...], remote_dir: str) -> tuple[lis
         files = _list_ftp_dir(host, remote_dir)
         if files:
             return files, host
-        logger.warning(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
+        logger.debug(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
     return [], None
 
 

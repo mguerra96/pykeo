@@ -24,7 +24,7 @@ ARC_MAX_GAP        = dt.timedelta(minutes=2)
 SYSTEMS = ["G", "E", "R", "C"]
 
 # vTEC consecutive-epoch jump leveling (applied per arc after calibration)
-VTEC_JUMP_THRESHOLD = 0.5  # TECU
+VTEC_JUMP_THRESHOLD = 0.1  # TECU
 
 # Savitzky-Golay detrending
 SG_WINDOW = 181
