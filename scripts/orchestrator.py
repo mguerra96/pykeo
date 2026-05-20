@@ -52,6 +52,7 @@ from pykeo_lib.stations import ensure_station_networks, station_ids_from_network
 # ---------------------------------------------------------------------------
 
 def _setup_logging(log_path: Path) -> logging.Logger:
+    """Configure console + file logging for both the orchestrator and pykeo_lib loggers."""
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -101,6 +102,7 @@ def _prefetch_obs(
     logger: logging.Logger,
     work_dir: Path = Path("."),
 ) -> None:
+    """Download obs files for target_date in advance (D+1 prefetch in year mode)."""
     logger.info(f"  Prefetching obs for {target_date}...")
     download_obs_gnssgiving(target_date, stations, obs_dir, work_dir=work_dir)
 
@@ -139,6 +141,7 @@ def _cleanup_obs_dir(obs_dir: Path, start_date: date, logger: logging.Logger) ->
 # ---------------------------------------------------------------------------
 
 def _append_csv_row(csv_path: Path, row: dict) -> None:
+    """Append one row to a CSV progress log, writing the header on first call."""
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -152,6 +155,7 @@ def _append_csv_row(csv_path: Path, row: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _all_outputs_exist(date_str: str, tec_dir: Path, keo_dir: Path, mat_dir: Path) -> bool:
+    """Return True if keogram PNG and grid parquet both exist for the given date string."""
     return (
         (keo_dir / f"keogram_{date_str}.png").exists()
         and (mat_dir / f"keogram_grid_{date_str}.parquet").exists()
@@ -244,6 +248,7 @@ def orchestrate_year(
     keo_only: bool = False,
     n_stations: int = 300,
 ) -> None:
+    """Process all days in a year sequentially, with rolling obs cleanup and D+1 prefetch."""
     log_path = work_dir / f"orchestrator_{year}.log"
     csv_path = work_dir / f"pipeline_log_{year}.csv"
     logger   = _setup_logging(log_path)
@@ -324,6 +329,7 @@ def orchestrate_date(
     keo_only: bool = False,
     n_stations: int = 300,
 ) -> None:
+    """Process a single calendar day and clean up D-1/D+1 obs afterwards."""
     date_str = target_date.isoformat()
     log_path = work_dir / f"orchestrator_{date_str}.log"
     logger   = _setup_logging(log_path)

@@ -23,7 +23,8 @@ pykeo/                          ← project root
 ├── tec_data/                   ← raw GNSS data (created at runtime)
 │   ├── obs/                    ← RINEX obs files (rolling 3-day window)
 │   ├── nav/                    ← NAV/BRDC files (kept for the whole run)
-│   └── errors/                 ← obs files that caused processing errors
+│   ├── errors/                 ← obs files that caused processing errors
+│   └── _tmp/                   ← per-station temp parquets (created and deleted each day)
 │
 ├── results/                    ← pipeline outputs (created at runtime)
 │   ├── tec_data/               ← tec_<date>.parquet  (full calibrated output)
@@ -47,7 +48,7 @@ coordinates from the RINEX headers, optionally sub-samples stations for spatial
 coverage using farthest-point sampling, and writes a station→network JSON ready
 for `orchestrator.py`.
 
-**Networks:** EUREF (`www.epncb.oma.be`), RING, NOA, SWEPOS, ASG-EUPOS (`gnssgiving.int.ingv.it`)
+**Networks:** EUREF (`www.epncb.oma.be`), RING, NOA, SWEPOS, ASG-EUPOS (`mga.int.ingv.it`, falling back to `gnssgiving.int.ingv.it`)
 
 **Decompression chain** applied to every downloaded file:
 `.Z` → unlzw3 (or gzip if mislabelled) → `.gz` → gzip → Hatanaka (crx2rnx.exe)
@@ -119,9 +120,9 @@ python orchestrator.py --date 2025-06-21 --keo-only
 **Processing steps:**
 1. Download obs for D-1, D, D+1 from gnssgiving (prefetch D+1 in year mode)
 2. Download NAV (BRDC) for D-1, D, D+1 from EUREF and BKG
-3. Parse RINEX obs + nav, precompute satellite coordinates on a common epoch grid
-4. Per station in parallel: extract arcs → compute STEC/VTEC → Savitzky-Golay detrend → compute IPP
-5. Combine all stations, clip to the target day, save outputs
+3. Parse RINEX obs + nav, precompute satellite coordinates on a common epoch grid; write to `_tmp/` so workers read from disk rather than receiving the large DataFrame through IPC pipes
+4. Per station in parallel: filter GLONASS SVs with no valid channel → extract arcs → compute STEC/VTEC → Savitzky-Golay detrend → compute IPP → write result to `_tmp/`
+5. Main process reads per-station parquets, concatenates, deletes temp files, saves outputs
 
 **Skip logic (year mode):** a day is skipped only when ALL three outputs already exist:
 `tec_<date>.parquet`, `keogram_<date>.png`, and `keogram_grid_<date>.parquet`.

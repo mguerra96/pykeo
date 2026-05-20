@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _date_to_year_doy(d: date) -> tuple[int, int]:
+    """Return (year, day-of-year) for a given date."""
     return d.year, d.timetuple().tm_yday
 
 
 def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
+    """List filenames in an FTP directory; returns empty list on any error."""
     try:
         with ftplib.FTP(host, timeout=FTP_TIMEOUT_LIST) as ftp:
             ftp.login()
@@ -86,6 +88,7 @@ def _filter_obs_filenames(
     all_files: list[str],
     stations_upper: set[str] | None,
 ) -> list[str]:
+    """Return compressed obs files (.gz/.Z) optionally filtered to a station subset."""
     return [
         f for f in all_files
         if (f.endswith(".gz") or f.endswith(".Z"))
@@ -100,6 +103,7 @@ def _download_parallel(
     host: str,
     max_workers: int,
 ) -> list[Path]:
+    """Download a list of files from an FTP host in parallel; returns successfully downloaded paths."""
     downloaded: list[Path] = []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as pool:
         futures = {
@@ -189,6 +193,7 @@ def download_obs_gnssgiving(
 # ---------------------------------------------------------------------------
 
 def _get_local_nav_files(nav_dir: Path, year: int, doy: int) -> list[Path]:
+    """Return already-downloaded NAV files for a given year/DOY (RINEX 2 and 3 patterns)."""
     yy = str(year)[-2:]
     files = list(nav_dir.glob(f"*BRDC*{year}*{doy:03d}*"))
     files.extend(nav_dir.glob(f"brdc{doy:03d}0.{yy}*"))
@@ -196,6 +201,7 @@ def _get_local_nav_files(nav_dir: Path, year: int, doy: int) -> list[Path]:
 
 
 def _download_nav_euref(year: int, doy: int, nav_dir: Path) -> list[Path]:
+    """Download BRDC NAV file for a given year/DOY from the EUREF EPN FTP."""
     remote_dir = f"/pub/obs/BRDC/{year}"
     nav_dir.mkdir(parents=True, exist_ok=True)
     try:

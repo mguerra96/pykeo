@@ -51,6 +51,7 @@ def _savitzky_golay_detrend(
     sg_order: int = SG_ORDER,
     mm_window: int = MM_WINDOW,
 ) -> pl.DataFrame:
+    """Apply Savitzky-Golay detrending + moving-mean smoothing to each arc; adds vtec_detrended column."""
     results = []
     for (arc_id,), group in df.group_by(["id_arc_valid"]):
         if len(group) < sg_window:
@@ -74,15 +75,16 @@ def process_station(
     obs_paths: list[Path],
     nav_dict: dict,
     glonass_channels: dict,
-    df_sat_coords: pl.DataFrame,
+    sat_coords_path: Path,
     epoch_filter: tuple[dt.datetime, dt.datetime],
     epoch_clip: tuple[dt.datetime, dt.datetime],
     pipeline_kwargs: dict,
-) -> pl.DataFrame | None:
+    out_dir: Path | None = None,
+) -> Path | None:
     """
     Calibrate TEC for one station using three daily obs files (D-1, D, D+1).
 
-    Returns a DataFrame with COLS_TO_KEEP columns, clipped to the target day.
+    Writes result to a temp parquet in out_dir and returns the Path.
     Returns None if the station should be skipped (no data, short arcs, etc.).
     Returns ("error", obs_paths) on unrecoverable error so the caller can log it.
     """
@@ -114,6 +116,13 @@ def process_station(
         )
         ctx.glonass_channels.update(glonass_channels)
 
+        # Drop GLONASS SVs with no valid channel (absent or null in nav data) —
+        # they would survive .replace() as strings and fail the strict Float32 cast.
+        known_glonass = {sv for sv, k in ctx.glonass_channels.items() if k is not None}
+        df_obs = df_obs.filter(
+            ~pl.col("sv").str.starts_with("R") | pl.col("sv").is_in(known_glonass)
+        )
+
         df_lc   = calculate_linear_combinations(df_obs, ctx=ctx)
         df_arcs = extract_arcs(
             df=df_lc,
@@ -125,6 +134,7 @@ def process_station(
             max_gap=pipeline_kwargs.get("arc_max_gap", ARC_MAX_GAP),
         )
 
+        df_sat_coords = pl.read_parquet(sat_coords_path)
         df_coords = df_sat_coords.join(df_arcs.select(["sv", "epoch"]), on=["sv", "epoch"], how="inner")
         df_geom   = df_arcs.join(df_coords, on=["sv", "epoch"], how="left")
         df_final  = calculate_ipp(
@@ -147,7 +157,9 @@ def process_station(
         )
 
         logger.debug(f"  -> {len(df_out):,} rows for {label}")
-        return df_out
+        tmp = (out_dir or Path(".")) / f"_tec_{label}.parquet"
+        df_out.write_parquet(tmp)
+        return tmp
 
     except BaseException as e:
         logger.error(f"Error on {label}: {e}")
@@ -188,10 +200,7 @@ def _drop_jumpy_svs(df_sat_coords: pl.DataFrame, max_step_m: float = 500_000.0) 
 
 
 def _group_obs_by_station(obs_files: list[Path]) -> dict[str, list[Path]]:
-    """
-    Group obs files by 4-char station code.
-    When both RINEX 2 and RINEX 3 are present for the same station, keep only RINEX 3.
-    """
+    """Group obs files by 4-char station code; prefer RINEX 3 over RINEX 2 when both exist."""
     raw: dict[str, list[Path]] = {}
     for f in sorted(obs_files):
         raw.setdefault(f.name[:4].upper(), []).append(f)
@@ -322,17 +331,23 @@ def run(
     n_workers      = min(12, len(station_groups))
     errors_dir     = work_dir / "tec_data" / "errors"
     error_log      = errors_dir / f"errors_{input_date}.txt"
+    tmp_dir        = work_dir / "tec_data" / "_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    sat_coords_path = tmp_dir / f"_sat_coords_{input_date}.parquet"
+    df_sat_coords.write_parquet(sat_coords_path)
 
     logger.info(f"Calibrating {len(station_groups)} stations with {n_workers} workers...")
-    frames: list[pl.DataFrame] = []
+    tmp_paths: list[Path] = []
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {
             pool.submit(
                 process_station,
                 paths, nav_dict, glonass_channels,
-                df_sat_coords, epoch_filter, epoch_clip,
+                sat_coords_path, epoch_filter, epoch_clip,
                 dict(pipeline_kwargs),
+                tmp_dir,
             ): paths
             for paths in station_groups
         }
@@ -346,13 +361,18 @@ def run(
                             p.unlink(missing_ok=True)
                             fh.write(p.name + "\n")
                             logger.info(f"[deleted, logged] {p.name}")
-                elif result is not None and len(result) > 0:
-                    frames.append(result)
+                elif result is not None:
+                    tmp_paths.append(result)
                 pbar.update()
 
-    if not frames:
+    if not tmp_paths:
         logger.error("No data produced after calibration.")
         return pl.DataFrame()
+
+    frames = [pl.read_parquet(p) for p in tmp_paths]
+    for p in tmp_paths:
+        p.unlink(missing_ok=True)
+    sat_coords_path.unlink(missing_ok=True)
 
     merged = pl.concat(frames).sort(["epoch", "sv"])
     logger.info(f"Pipeline done: {len(merged):,} rows from {len(frames)} stations")
