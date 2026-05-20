@@ -5,6 +5,7 @@ Per-station TEC calibration pipeline: obs grouping, SG detrending, run().
 import datetime as dt
 import logging
 import os
+import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date
@@ -106,9 +107,14 @@ def process_station(
     try:
         frames, rec_pos, rinex_version = [], None, None
         for p in sorted(obs_paths):
+            if not p.exists():
+                logger.warning(f"[{label}] obs file missing on disk, skipping: {p.name}")
+                continue
             df_i, rp, rv = read_rinex_obs(str(p))
             frames.append(df_i)
             rec_pos, rinex_version = rp, rv
+        if not frames:
+            return None
         df_obs = pl.concat(frames).sort("epoch")
 
         df_obs = df_obs.filter(
@@ -235,6 +241,7 @@ def run(
     work_dir: Path = Path("."),
     pipeline_kwargs: dict | None = None,
     fallback_year: int | None = None,
+    n_stations_target: int | None = None,
 ) -> pl.DataFrame:
     """
     Run the full TEC calibration pipeline for one day.
@@ -279,6 +286,7 @@ def run(
             return input_date.year  # D-1 of Jan 1 → use primary year JSON
         return None
 
+    t_download = time.perf_counter()
     all_obs: list[Path] = []
     for d in (date_prev, input_date, date_next):
         all_obs += download_obs_gnssgiving(
@@ -286,7 +294,10 @@ def run(
             work_dir=work_dir,
             fallback_year=_fallback_for(d),
         )
+    download_elapsed = time.perf_counter() - t_download
+    logger.warning(f"Download completed in {download_elapsed:.0f}s")
 
+    t_process = time.perf_counter()
     year, doy = _date_to_year_doy(input_date)
     target_ydoy_long  = f"{year}{doy:03d}"           # RINEX 3: STAT...20160010000...
     target_ydoy_short = f"{doy:03d}0.{year % 100:02d}"  # RINEX 2: xxxx0010.16o
@@ -299,7 +310,13 @@ def run(
         return pl.DataFrame()
 
     station_files = _group_obs_by_station(all_obs)
-    logger.info(f"Stations with obs: {len(station_files)}")
+    n_avail = len(station_files)
+    if n_stations_target:
+        logger.warning(
+            f"{n_avail} stations available out of {n_stations_target} for DOY {doy:03d} ({input_date})"
+        )
+    else:
+        logger.warning(f"{n_avail} stations available for DOY {doy:03d} ({input_date})")
 
     logger.debug("Downloading NAV for D-1, D, D+1...")
     nav_dicts = []
@@ -392,5 +409,7 @@ def run(
     sat_coords_path.unlink(missing_ok=True)
 
     merged = pl.concat(frames).sort(["epoch", "sv"])
+    processing_elapsed = time.perf_counter() - t_process
     logger.info(f"Pipeline done: {len(merged):,} rows from {len(frames)} stations")
+    logger.warning(f"Processing completed in {processing_elapsed:.0f}s for DOY {doy:03d} ({input_date})")
     return merged

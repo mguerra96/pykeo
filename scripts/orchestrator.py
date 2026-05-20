@@ -172,6 +172,7 @@ def process_day(
     logger: logging.Logger,
     csv_path: Path | None = None,
     keo_only: bool = False,
+    n_stations_target: int | None = None,
 ) -> bool:
     """
     Run the full pipeline (or keogram-only) for one calendar day.
@@ -200,7 +201,12 @@ def process_day(
 
     t_start = time.perf_counter()
     try:
-        df = run(input_date=target_date, stations=stations, work_dir=work_dir)
+        df = run(
+            input_date=target_date,
+            stations=stations,
+            work_dir=work_dir,
+            n_stations_target=n_stations_target,
+        )
     except Exception as e:
         logger.error(f"  Pipeline failed for {date_str}: {e}")
         return False
@@ -304,6 +310,7 @@ def orchestrate_year(
             logger=logger,
             csv_path=csv_path,
             keo_only=keo_only,
+            n_stations_target=n_stations,
         )
 
         if ok:
@@ -358,6 +365,7 @@ def orchestrate_date(
         logger=logger,
         csv_path=None,
         keo_only=keo_only,
+        n_stations_target=n_stations,
     )
 
     if not keo_only:
