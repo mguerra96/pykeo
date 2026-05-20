@@ -18,7 +18,7 @@ from .constants import (
     FTP_HOST,
     FTP_TIMEOUT_DOWNLOAD,
     FTP_TIMEOUT_LIST,
-    GNSSGIVING_HOST,
+    GNSSGIVING_HOSTS,
 )
 from .decompress import decompress, expected_final_path
 from .stations import load_station_networks
@@ -46,6 +46,16 @@ def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
     except Exception as e:
         logger.error(f"FTP listing failed {host}{remote_dir}: {e}")
         return []
+
+
+def _list_ftp_dir_failover(hosts: tuple[str, ...], remote_dir: str) -> tuple[list[str], str | None]:
+    """Try each host in order; return (files, host_that_worked) or ([], None)."""
+    for host in hosts:
+        files = _list_ftp_dir(host, remote_dir)
+        if files:
+            return files, host
+        logger.warning(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
+    return [], None
 
 
 def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str = FTP_HOST) -> Path | None:
@@ -155,10 +165,10 @@ def download_obs_gnssgiving(
     downloaded: list[Path] = []
     for network, base_path in networks_to_query.items():
         remote_dir = f"{base_path}/{year}/{doy:03d}"
-        logger.debug(f"[{network}] listing {GNSSGIVING_HOST}{remote_dir}")
-        all_files = _list_ftp_dir(GNSSGIVING_HOST, remote_dir)
+        logger.debug(f"[{network}] listing {remote_dir} (hosts: {GNSSGIVING_HOSTS})")
+        all_files, host = _list_ftp_dir_failover(GNSSGIVING_HOSTS, remote_dir)
         if not all_files:
-            logger.warning(f"[{network}] No files found for {input_date} (DOY {doy:03d}).")
+            logger.warning(f"[{network}] No files found on any host for {input_date} (DOY {doy:03d}).")
             continue
 
         targets = _filter_obs_filenames(all_files, stations_upper)
@@ -166,9 +176,9 @@ def download_obs_gnssgiving(
             logger.debug(f"[{network}] No matching files for {input_date}.")
             continue
 
-        logger.debug(f"[{network}] {len(targets)} files to download")
+        logger.debug(f"[{network}] {len(targets)} files to download from {host}")
         downloaded.extend(
-            _download_parallel(targets, remote_dir, local_dir, GNSSGIVING_HOST, max_workers)
+            _download_parallel(targets, remote_dir, local_dir, host, max_workers)
         )
 
     return downloaded

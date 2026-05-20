@@ -6,8 +6,8 @@ FTP_HOST             = "www.epncb.oma.be"
 FTP_TIMEOUT_LIST     = 120
 FTP_TIMEOUT_DOWNLOAD = 120
 
-# gnssgiving FTP
-GNSSGIVING_HOST = "gnssgiving.int.ingv.it"
+# gnssgiving FTP — primary + fallback hosts (same directory layout)
+GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")
 
 # Ionospheric pierce point
 H_IPP         = 300_000   # m (300 km)

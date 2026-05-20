@@ -1,4 +1,4 @@
-$years = 2017
+$years = 2017,2018
 
 foreach ($y in $years) {
     Write-Host ""

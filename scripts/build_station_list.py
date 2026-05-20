@@ -75,8 +75,8 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_DIR = _PROJECT_ROOT / "network" / "station_rnx"
 CRX2RNX    = Path(__file__).parent.parent / "crx2rnx.exe"
 
-GNSSGIVING_HOST = "gnssgiving.int.ingv.it"
-GNSSGIVING_BASE = "/CONTINUOUS/30s"
+GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")
+GNSSGIVING_BASE  = "/CONTINUOUS/30s"
 
 # Bounding box for station filtering
 LAT_MIN, LAT_MAX = 35.0, 60.0
@@ -194,19 +194,30 @@ def decompress_and_dehatanaka(local_path: Path) -> Path | None:
 # FTP helpers
 # ---------------------------------------------------------------------------
 
-def _list_ftp_dir(remote_dir: str) -> list[str]:
+def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
     try:
-        with ftplib.FTP(GNSSGIVING_HOST, timeout=FTP_TIMEOUT_LIST) as ftp:
+        with ftplib.FTP(host, timeout=FTP_TIMEOUT_LIST) as ftp:
             ftp.login()
             ftp.cwd(remote_dir)
             return [Path(f).name for f in ftp.nlst()]
     except Exception as e:
-        log.debug(f"FTP listing failed {remote_dir}: {e}")
+        log.debug(f"FTP listing failed {host}{remote_dir}: {e}")
         return []
 
 
+def _list_ftp_dir_failover(remote_dir: str) -> tuple[list[str], str | None]:
+    """Try GNSSGIVING_HOSTS in order; return (files, host_that_worked) or ([], None)."""
+    for host in GNSSGIVING_HOSTS:
+        files = _list_ftp_dir(host, remote_dir)
+        if files:
+            return files, host
+        log.warning(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
+    return [], None
+
+
 def _list_networks() -> list[str]:
-    return _list_ftp_dir(GNSSGIVING_BASE)
+    files, _ = _list_ftp_dir_failover(GNSSGIVING_BASE)
+    return files
 
 
 def _is_obs_file(fname: str) -> bool:
@@ -235,13 +246,13 @@ def _expected_final_path(fname: str, local_dir: Path) -> Path:
     return stem_path
 
 
-def _download_one(fname: str, remote_dir: str, local_dir: Path) -> Path | None:
+def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str) -> Path | None:
     final_path = _expected_final_path(fname, local_dir)
     if final_path.exists():
         return final_path
     raw_path = local_dir / fname
     try:
-        with ftplib.FTP(GNSSGIVING_HOST, timeout=FTP_TIMEOUT_DOWNLOAD) as ftp:
+        with ftplib.FTP(host, timeout=FTP_TIMEOUT_DOWNLOAD) as ftp:
             ftp.login()
             ftp.cwd(remote_dir)
             with open(raw_path, "wb") as f:
@@ -259,14 +270,14 @@ def _download_one(fname: str, remote_dir: str, local_dir: Path) -> Path | None:
 
 def download_network(network: str, remote_dir: str, local_dir: Path, workers: int) -> list[Path]:
     local_dir.mkdir(parents=True, exist_ok=True)
-    files = _list_ftp_dir(remote_dir)
+    files, host = _list_ftp_dir_failover(remote_dir)
     obs_files = [f for f in files if _is_obs_file(f)]
     if not obs_files:
         return []
 
     downloaded: list[Path] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_download_one, f, remote_dir, local_dir): f for f in obs_files}
+        futs = {pool.submit(_download_one, f, remote_dir, local_dir, host): f for f in obs_files}
         with tqdm(total=len(futs), desc=f"{network:12s}", unit="file", leave=True) as pbar:
             for fut in as_completed(futs):
                 result = fut.result()
