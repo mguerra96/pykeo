@@ -62,9 +62,10 @@ def _list_ftp_dir_failover(hosts: tuple[str, ...], remote_dir: str) -> tuple[lis
 
 def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str = FTP_HOST) -> Path | None:
     final_path = expected_final_path(fname, local_dir)
-    if final_path.exists():
+    if final_path.exists() and final_path.stat().st_size > 0:
         logger.debug(f"[skip] {fname} (already exists)")
         return final_path
+    final_path.unlink(missing_ok=True)  # remove zero-byte leftover before re-downloading
 
     raw_path = local_dir / fname
     try:
@@ -172,7 +173,7 @@ def download_obs_gnssgiving(
         logger.debug(f"[{network}] listing {remote_dir} (hosts: {GNSSGIVING_HOSTS})")
         all_files, host = _list_ftp_dir_failover(GNSSGIVING_HOSTS, remote_dir)
         if not all_files:
-            logger.warning(f"[{network}] No files found on any host for {input_date} (DOY {doy:03d}).")
+            logger.warning(f"No data for {network} for DOY {doy:03d} ({input_date}).")
             continue
 
         targets = _filter_obs_filenames(all_files, stations_upper)
