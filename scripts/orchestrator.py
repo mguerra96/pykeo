@@ -161,6 +161,7 @@ def process_day(
     csv_path: Path | None = None,
     keo_only: bool = False,
     n_stations_target: int | None = None,
+    exclude_sv: list[str] | None = None,
 ) -> bool:
     """
     Run the full pipeline (or keogram-only) for one calendar day.
@@ -180,6 +181,10 @@ def process_day(
         logger.info(f"[KEO-ONLY] Regenerating keogram for {date_str}")
         import polars as pl
         df = pl.read_parquet(out_parquet)
+        if exclude_sv:
+            n_before = len(df)
+            df = df.filter(~pl.col("sv").is_in(exclude_sv))
+            logger.info(f"  Excluded SV {exclude_sv}: dropped {n_before - len(df):,} rows")
         plot_keogram(df, out_keogram, input_date=target_date, grid_out_path=out_keo_grid)
         return True
 
@@ -241,6 +246,7 @@ def orchestrate_year(
     start_date: date | None = None,
     keo_only: bool = False,
     n_stations: int = 300,
+    exclude_sv: list[str] | None = None,
 ) -> None:
     """Process all days in a year sequentially, with rolling obs cleanup and D+1 prefetch."""
     log_path = work_dir / f"orchestrator_{year}.log"
@@ -295,6 +301,7 @@ def orchestrate_year(
             csv_path=csv_path,
             keo_only=keo_only,
             n_stations_target=n_stations,
+            exclude_sv=exclude_sv,
         )
 
         if ok:
@@ -319,6 +326,7 @@ def orchestrate_date(
     stations: list[str] | None,
     keo_only: bool = False,
     n_stations: int = 300,
+    exclude_sv: list[str] | None = None,
 ) -> None:
     """Process a single calendar day and clean up D-1/D+1 obs afterwards."""
     date_str = target_date.isoformat()
@@ -350,6 +358,7 @@ def orchestrate_date(
         csv_path=None,
         keo_only=keo_only,
         n_stations_target=n_stations,
+        exclude_sv=exclude_sv,
     )
 
     if not keo_only:
@@ -390,6 +399,9 @@ if __name__ == "__main__":
                              "parquets — no FTP downloads")
     parser.add_argument("--n-stations",   type=int, default=300, metavar="N",
                         help="Number of stations to select when auto-building station network")
+    parser.add_argument("--exclude-sv",    nargs="+", default=None, metavar="SV",
+                        help="Drop these SV codes (e.g. R09) from the keogram only; "
+                             "the saved TEC parquet is not modified")
 
     args = parser.parse_args()
 
@@ -416,6 +428,7 @@ if __name__ == "__main__":
             start_date=start_date,
             keo_only=args.keo_only,
             n_stations=args.n_stations,
+            exclude_sv=args.exclude_sv,
         )
     else:
         if args.start_date:
@@ -427,4 +440,5 @@ if __name__ == "__main__":
             stations=stations,
             keo_only=args.keo_only,
             n_stations=args.n_stations,
+            exclude_sv=args.exclude_sv,
         )

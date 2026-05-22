@@ -106,6 +106,10 @@ python orchestrator.py --year 2025 --stations-file network/station_lists/station
 # Regenerate keograms from existing parquets (no downloads):
 python orchestrator.py --year 2025 --keo-only
 python orchestrator.py --date 2025-06-21 --keo-only
+
+# Regenerate keograms excluding specific SVs (parquets are not modified):
+python orchestrator.py --year 2017 --keo-only --exclude-sv R09
+python orchestrator.py --year 2017 --keo-only --exclude-sv R09 R12
 ```
 
 | Argument | Default | Description |
@@ -116,9 +120,10 @@ python orchestrator.py --date 2025-06-21 --keo-only
 | `--stations-file` | — | JSON (station→network) or text (one ID per line) to restrict stations |
 | `--start-date` | Jan 1 | Resume year run from this date (`--year` only) |
 | `--keo-only` | false | Regenerate keogram PNG + grid parquet from existing parquets — no FTP downloads |
+| `--exclude-sv` | — | Drop one or more SV codes (e.g. `R09`) from the keogram only; the saved TEC parquets are not modified |
 
 **Processing steps:**
-1. Download obs for D-1, D, D+1 from gnssgiving (prefetch D+1 in year mode)
+1. Download obs for D-1, D, D+1 from gnssgiving
 2. Download NAV (BRDC) for D-1, D, D+1 from EUREF and BKG
 3. Parse RINEX obs + nav, precompute satellite coordinates on a common epoch grid; write to `_tmp/` so workers read from disk rather than receiving the large DataFrame through IPC pipes
 4. Per station in parallel: filter GLONASS SVs with no valid channel → extract arcs → compute STEC/VTEC → Savitzky-Golay detrend → compute IPP → write result to `_tmp/`
@@ -128,7 +133,7 @@ python orchestrator.py --date 2025-06-21 --keo-only
 `tec_<date>.parquet`, `keogram_<date>.png`, and `keogram_grid_<date>.parquet`.
 
 **Obs-file lifecycle (rolling 3-day window):**
-- Before processing day D: prefetch D+1 obs from all networks
+- Each day D downloads D-1, D, and D+1 obs on demand
 - After processing day D: delete D-1 obs to free disk space
 - NAV files cover the whole year and are never deleted
 
@@ -177,13 +182,16 @@ python orchestrator.py --year 2015 --stations-file network/station_lists/station
 
 # 3. Re-plot keograms without re-downloading (e.g. after changing colour scale)
 python orchestrator.py --year 2015 --keo-only
+
+# 4. Re-plot excluding a noisy SV (parquets untouched)
+python orchestrator.py --year 2015 --keo-only --exclude-sv R09
 ```
 
 ---
 
 ## Dependencies
 
-- `pytecgg` — core GNSS TEC library (installed in `.venv`)
+- `pytecgg` — core GNSS TEC library (installed in `.venv` from the `develop` branch; requires Python ≥ 3.11)
 - `polars` — DataFrame processing
 - `numpy`, `scipy` — numerical operations and Savitzky-Golay filtering
 - `matplotlib`, `cartopy` — plotting and maps

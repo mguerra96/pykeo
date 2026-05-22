@@ -64,6 +64,9 @@ def plot_keogram(
     lat_range: tuple[float, float] = KEO_LAT_RANGE,
     min_ele: float = MIN_ELEVATION,
     dtec_clim: float = KEO_DTEC_CLIM,
+    gauss_sigma: float = KEO_GAUSS_SIGMA,
+    lat_step: float = KEO_LAT_STEP,
+    time_step: int = KEO_TIME_STEP,
     grid_out_path: Path | None = None,
 ) -> None:
     """
@@ -90,8 +93,8 @@ def plot_keogram(
 
     t0_us    = int(t0.timestamp() * 1e6)
     sod_raw  = (df["epoch"].cast(pl.Int64) - t0_us).to_numpy() / 1e6
-    sod_grid = np.arange(0, 86400, KEO_TIME_STEP)
-    lat_grid = np.arange(lat_range[0], lat_range[1] + KEO_LAT_STEP, KEO_LAT_STEP)
+    sod_grid = np.arange(0, 86400, time_step)
+    lat_grid = np.arange(lat_range[0], lat_range[1] + lat_step, lat_step)
 
     sod_snap = sod_grid[np.searchsorted(sod_grid, sod_raw).clip(0, len(sod_grid) - 1)]
     lat_snap = lat_grid[np.searchsorted(lat_grid, df["lat_ipp"].to_numpy()).clip(0, len(lat_grid) - 1)]
@@ -112,8 +115,8 @@ def plot_keogram(
 
     grid = _keo_fill_2d(grid)
 
-    if KEO_GAUSS_SIGMA > 0:
-        grid = _keo_smooth(grid, KEO_GAUSS_SIGMA)
+    if gauss_sigma > 0:
+        grid = _keo_smooth(grid, gauss_sigma)
 
     if grid_out_path is not None:
         pl.DataFrame(
