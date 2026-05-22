@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pykeo_lib.constants import DEFAULT_LON_SPAN
-from pykeo_lib.download import _date_to_year_doy, download_obs_gnssgiving
+from pykeo_lib.download import _date_to_year_doy
 from pykeo_lib.keogram import plot_keogram
 from pykeo_lib.pipeline import run
 from pykeo_lib.stations import ensure_station_networks, station_ids_from_networks
@@ -93,18 +93,6 @@ def _delete_obs_day(obs_dir: Path, target_date: date, logger: logging.Logger) ->
     )
     if deleted:
         logger.info(f"  Deleted {deleted} obs file(s) for {target_date} (DOY {doy:03d})")
-
-
-def _prefetch_obs(
-    target_date: date,
-    stations: list[str] | None,
-    obs_dir: Path,
-    logger: logging.Logger,
-    work_dir: Path = Path("."),
-) -> None:
-    """Download obs files for target_date in advance (D+1 prefetch in year mode)."""
-    logger.info(f"  Prefetching obs for {target_date}...")
-    download_obs_gnssgiving(target_date, stations, obs_dir, work_dir=work_dir)
 
 
 def _cleanup_obs_dir(obs_dir: Path, start_date: date, logger: logging.Logger) -> None:
@@ -289,16 +277,12 @@ def orchestrate_year(
     for target_date in days:
         date_str  = target_date.isoformat()
         date_prev = target_date - dt.timedelta(days=1)
-        date_next = target_date + dt.timedelta(days=1)
 
         if not keo_only and _all_outputs_exist(date_str, tec_dir, keo_dir, mat_dir):
             logger.debug(f"[SKIP] {date_str} — all outputs exist.")
             _delete_obs_day(obs_dir, target_date - dt.timedelta(days=2), logger)
             success_count += 1
             continue
-
-        if not keo_only:
-            _prefetch_obs(date_next, stations, obs_dir, logger, work_dir=work_dir)
 
         ok = process_day(
             target_date=target_date,
