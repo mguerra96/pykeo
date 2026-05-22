@@ -21,3 +21,5 @@ pipeline_log_*.csv
 # OS
 Thumbs.db
 .DS_Store
+
+forecast_idea.md

@@ -12,6 +12,7 @@ pykeo/                          ← project root
 ├── scripts/                    ← all Python scripts
 │   ├── orchestrator.py         ← sole CLI entry point
 │   ├── build_station_list.py   ← one-time station network builder
+│   ├── test_keogram_plot.py    ← interactive keogram tester (parameter experiments)
 │   └── pykeo_lib/              ← internal library package
 │       ├── constants.py
 │       ├── decompress.py
@@ -29,7 +30,8 @@ pykeo/                          ← project root
 ├── results/                    ← pipeline outputs (created at runtime)
 │   ├── tec_data/               ← tec_<date>.parquet  (full calibrated output)
 │   ├── keo_image/              ← keogram_<date>.png
-│   └── keo_mat/                ← keogram_grid_<date>.parquet  (2-D grid for re-plotting)
+│   ├── keo_mat/                ← keogram_grid_<date>.parquet  (2-D grid for re-plotting)
+│   └── _keo_test/              ← test keograms from test_keogram_plot.py
 │
 └── network/                    ← station metadata
     ├── station_rnx/            ← RINEX obs downloaded by build_station_list.py
@@ -84,7 +86,48 @@ invokes `build_station_list.py --date <year>-06-21` automatically.
 
 ---
 
-### 2. `orchestrator.py` — TEC calibration pipeline (single day or full year)
+### 2. `test_keogram_plot.py` — interactive keogram tester
+
+Reads a TEC parquet and calls the same `plot_keogram` function used by the pipeline,
+with CLI flags to override every tunable constant in `constants.py`. Use this script
+to experiment with gridding and display parameters without touching the pipeline.
+Output goes to `results/_keo_test/` (separate from the pipeline's `results/keo_image/`).
+
+```
+# by date (resolves parquet from results/tec_data/ automatically)
+python test_keogram_plot.py --date 2015-06-21
+
+# explicit parquet path
+python test_keogram_plot.py tec_2015-06-21.parquet
+
+# override parameters
+python test_keogram_plot.py --date 2015-06-21 --clim 0.3 --gauss-sigma 1.5
+python test_keogram_plot.py --date 2015-06-21 --lon-span 10 25 --lat-range 37.5 57.5
+python test_keogram_plot.py --date 2015-06-21 --lat-step 0.1 --time-step 60
+python test_keogram_plot.py --date 2015-06-21 --exclude-sv R09 R12
+
+# also save the 2-D grid as parquet
+python test_keogram_plot.py --date 2015-06-21 --save-grid
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `PARQUET` | — | Explicit path to a TEC parquet (omit to use `--date`) |
+| `--date` | — | Date `YYYY-MM-DD`; resolves parquet from `results/tec_data/` |
+| `--out` | `results/_keo_test/keogram_<date>.png` | Output PNG path |
+| `--lon-span` | `DEFAULT_LON_SPAN` | Longitude range to include |
+| `--lat-range` | `KEO_LAT_RANGE` | Latitude range for the keogram |
+| `--min-ele` | `MIN_ELEVATION` | Minimum satellite elevation cutoff [deg] |
+| `--clim` | `KEO_DTEC_CLIM` | Colour scale ±limit [TECu] |
+| `--gauss-sigma` | `KEO_GAUSS_SIGMA` | Gaussian smoothing sigma [pixels]; 0 = no smoothing |
+| `--lat-step` | `KEO_LAT_STEP` | Latitude grid step [deg] |
+| `--time-step` | `KEO_TIME_STEP` | Time grid step [seconds] |
+| `--exclude-sv` | — | Drop these SV codes before plotting (e.g. `R09`) |
+| `--save-grid` | false | Also save the 2-D grid as parquet to `results/keo_mat/` |
+
+---
+
+### 3. `orchestrator.py` — TEC calibration pipeline (single day or full year)
 
 The sole CLI entry point. Downloads obs from gnssgiving networks and NAV (BRDC)
 from EUREF/BKG, calibrates TEC per station in parallel (`ProcessPoolExecutor`),
