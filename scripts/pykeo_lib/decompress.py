@@ -22,12 +22,15 @@ def _run_crx2rnx(p: Path) -> Path | None:
         logger.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
         return p
     try:
-        subprocess.run([str(CRX2RNX), str(p)], capture_output=True, check=False)
+        subprocess.run([str(CRX2RNX), str(p)], capture_output=True, check=False, timeout=5)
         out = p.with_suffix(p.suffix[:-1] + "O") if _is_hatanaka_rinex2(p) else p.with_suffix(".rnx")
         if out.exists():
             p.unlink(missing_ok=True)
             return out
         logger.warning(f"crx2rnx produced no output for {p.name}")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"crx2rnx timed out on {p.name} — skipping")
+        p.unlink(missing_ok=True)
     except Exception as e:
         logger.warning(f"crx2rnx error on {p.name}: {e}")
     return None

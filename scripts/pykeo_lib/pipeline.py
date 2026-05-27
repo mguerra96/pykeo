@@ -86,7 +86,6 @@ def _savitzky_golay_detrend(
 
 def process_station(
     obs_paths: list[Path],
-    nav_dict: dict,
     glonass_channels: dict,
     sat_coords_path: Path,
     epoch_filter: tuple[dt.datetime, dt.datetime],
@@ -364,7 +363,9 @@ def run(
     df_sat_coords = _drop_jumpy_svs(df_sat_coords)
 
     station_groups = list(station_files.values())
-    n_workers      = min(12, len(station_groups))
+    _max_workers   = int(os.environ.get("PYKEO_WORKERS", 8))
+    n_workers = min(_max_workers, len(station_groups))
+
     errors_dir     = work_dir / "tec_data" / "errors"
     error_log      = errors_dir / f"errors_{input_date}.txt"
     tmp_dir        = work_dir / "tec_data" / "_tmp"
@@ -376,30 +377,42 @@ def run(
     logger.info(f"Calibrating {len(station_groups)} stations with {n_workers} workers...")
     tmp_paths: list[Path] = []
 
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {
-            pool.submit(
-                process_station,
-                paths, nav_dict, glonass_channels,
-                sat_coords_path, epoch_filter, epoch_clip,
-                dict(pipeline_kwargs),
-                tmp_dir,
-            ): paths
-            for paths in station_groups
-        }
-        with tqdm(total=len(futures), desc="Calibrating", unit="station") as pbar:
-            for fut in as_completed(futures):
-                result = fut.result()
-                if isinstance(result, tuple) and result[0] == "error":
-                    errors_dir.mkdir(parents=True, exist_ok=True)
-                    with error_log.open("a") as fh:
-                        for p in result[1]:
-                            p.unlink(missing_ok=True)
-                            fh.write(p.name + "\n")
-                            logger.info(f"[deleted, logged] {p.name}")
-                elif result is not None:
-                    tmp_paths.append(result)
-                pbar.update()
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(
+                    process_station,
+                    paths, glonass_channels,
+                    sat_coords_path, epoch_filter, epoch_clip,
+                    dict(pipeline_kwargs),
+                    tmp_dir,
+                ): paths
+                for paths in station_groups
+            }
+            with tqdm(total=len(futures), desc="Calibrating", unit="station") as pbar:
+                for fut in as_completed(futures):
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        logger.warning(f"Worker error (skipping station): {e}")
+                        pbar.update()
+                        continue
+                    if isinstance(result, tuple) and result[0] == "error":
+                        errors_dir.mkdir(parents=True, exist_ok=True)
+                        with error_log.open("a") as fh:
+                            for p in result[1]:
+                                p.unlink(missing_ok=True)
+                                fh.write(p.name + "\n")
+                                logger.info(f"[deleted, logged] {p.name}")
+                    elif result is not None:
+                        tmp_paths.append(result)
+                    pbar.update()
+    except Exception as e:
+        logger.error(f"ProcessPoolExecutor failed (likely OOM): {e}")
+        # Return whatever partial results were collected before the crash
+        if not tmp_paths:
+            sat_coords_path.unlink(missing_ok=True)
+            return pl.DataFrame()
 
     if not tmp_paths:
         logger.error("No data produced after calibration.")

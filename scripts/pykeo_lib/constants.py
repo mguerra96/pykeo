@@ -5,6 +5,7 @@ from pathlib import Path
 FTP_HOST             = "www.epncb.oma.be"
 FTP_TIMEOUT_LIST     = 120
 FTP_TIMEOUT_DOWNLOAD = 120
+FTP_TIMEOUT_TRANSFER = 5     # wall-clock cap per file (retrbinary can stall indefinitely)
 
 # gnssgiving FTP — primary + fallback hosts (same directory layout)
 GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")

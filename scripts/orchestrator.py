@@ -42,9 +42,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from pykeo_lib.constants import DEFAULT_LON_SPAN
 from pykeo_lib.download import _date_to_year_doy
-from pykeo_lib.keogram import plot_keogram
 from pykeo_lib.pipeline import run
 from pykeo_lib.stations import ensure_station_networks, station_ids_from_networks
+
+# NOTE: plot_keogram is imported lazily inside process_day() to avoid loading
+# scipy in every ProcessPoolExecutor worker process spawned by pipeline.run().
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ def _setup_logging(log_path: Path) -> logging.Logger:
     # Attach handlers to the pykeo_lib package logger so download/pipeline
     # warnings propagate to the orchestrator log file.
     lib_logger = logging.getLogger("pykeo_lib")
-    lib_logger.setLevel(logging.WARNING)
+    lib_logger.setLevel(logging.INFO)
     lib_logger.addHandler(console_handler)
     lib_logger.addHandler(file_handler)
 
@@ -180,6 +182,7 @@ def process_day(
             return False
         logger.info(f"[KEO-ONLY] Regenerating keogram for {date_str}")
         import polars as pl
+        from pykeo_lib.keogram import plot_keogram
         df = pl.read_parquet(out_parquet)
         if exclude_sv:
             n_before = len(df)
@@ -221,6 +224,7 @@ def process_day(
     df.write_parquet(out_parquet, compression="zstd")
     logger.info(f"  Saved: {out_parquet.name}")
 
+    from pykeo_lib.keogram import plot_keogram
     plot_keogram(df, out_keogram, input_date=target_date, grid_out_path=out_keo_grid)
 
     if csv_path is not None:

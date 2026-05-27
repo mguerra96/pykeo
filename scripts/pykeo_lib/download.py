@@ -7,7 +7,7 @@ Nav: EUREF EPN FTP (/pub/obs/BRDC/), with BKG fallback.
 
 import ftplib
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from .constants import (
     FTP_HOST,
     FTP_TIMEOUT_DOWNLOAD,
     FTP_TIMEOUT_LIST,
+    FTP_TIMEOUT_TRANSFER,
     GNSSGIVING_HOSTS,
 )
 from .decompress import decompress, expected_final_path
@@ -113,7 +114,16 @@ def _download_parallel(
         }
         with tqdm(total=len(futures), unit="file", leave=False) as bar:
             for fut in as_completed(futures):
-                result = fut.result()
+                fname = futures[fut]
+                try:
+                    result = fut.result(timeout=FTP_TIMEOUT_TRANSFER)
+                except TimeoutError:
+                    logger.warning(f"[timeout] {fname} — download exceeded {FTP_TIMEOUT_TRANSFER}s, skipping")
+                    fut.cancel()
+                    result = None
+                except Exception as e:
+                    logger.warning(f"[error] {fname}: {e}")
+                    result = None
                 if result is not None:
                     downloaded.append(result)
                 bar.update(1)
