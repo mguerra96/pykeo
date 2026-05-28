@@ -10,6 +10,15 @@ FTP_TIMEOUT_TRANSFER = 5     # wall-clock cap per file (retrbinary can stall ind
 # gnssgiving FTP — primary + fallback hosts (same directory layout)
 GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")
 
+# CDDIS anonymous FTPS — primary multi-GNSS BRDC source.
+# IGS combined (BRDC00IGS_R) is the gold standard but only exists from ~2021;
+# DLR merged (BRDM00DLR_S) covers earlier years. Both avoid the cross-PRN
+# BeiDou-3 mis-attribution present in the EUREF/GOP product (BRDC00GOP_R).
+CDDIS_HOST = "gdc.cddis.eosdis.nasa.gov"
+CDDIS_TIMEOUT = 120
+# Product short-names in preference order; first available wins per day.
+CDDIS_NAV_PRODUCTS = ("BRDC00IGS_R", "BRDM00DLR_S")
+
 # Ionospheric pierce point
 H_IPP         = 300_000   # m (300 km)
 MIN_ELEVATION = 20        # degrees

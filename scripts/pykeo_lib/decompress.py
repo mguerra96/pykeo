@@ -2,6 +2,7 @@ import gzip
 import io
 import logging
 import subprocess
+import zipfile
 from pathlib import Path
 
 from .constants import CRX2RNX
@@ -22,7 +23,7 @@ def _run_crx2rnx(p: Path) -> Path | None:
         logger.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
         return p
     try:
-        subprocess.run([str(CRX2RNX), str(p)], capture_output=True, check=False, timeout=5)
+        subprocess.run([str(CRX2RNX), "-f", "-d", str(p)], capture_output=True, check=False, timeout=5)
         out = p.with_suffix(p.suffix[:-1] + "O") if _is_hatanaka_rinex2(p) else p.with_suffix(".rnx")
         if out.exists():
             p.unlink(missing_ok=True)
@@ -75,6 +76,13 @@ def decompress(raw_path: Path) -> Path | None:
         try:
             if raw[:2] == b"\x1f\x9d":
                 out.write_bytes(unlzw(raw))
+            elif raw[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    names = zf.namelist()
+                    if not names:
+                        logger.warning(f"empty ZIP for {raw_path.name}")
+                        return None
+                    out.write_bytes(zf.read(names[0]))
             else:
                 with gzip.open(io.BytesIO(raw), "rb") as fi:
                     out.write_bytes(fi.read())

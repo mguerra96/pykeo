@@ -2,7 +2,8 @@
 FTP download helpers for RINEX observation and navigation files.
 
 Obs: gnssgiving FTP (CONTINUOUS/30s networks).
-Nav: EUREF EPN FTP (/pub/obs/BRDC/), with BKG fallback.
+Nav: CDDIS multi-GNSS BRDC (IGS combined / DLR merged), with EUREF and BKG
+     fallback.
 """
 
 import ftplib
@@ -15,6 +16,9 @@ import polars as pl
 from tqdm import tqdm
 
 from .constants import (
+    CDDIS_HOST,
+    CDDIS_NAV_PRODUCTS,
+    CDDIS_TIMEOUT,
     FTP_HOST,
     FTP_TIMEOUT_DOWNLOAD,
     FTP_TIMEOUT_LIST,
@@ -203,12 +207,77 @@ def download_obs_gnssgiving(
 # Nav downloaders (public)
 # ---------------------------------------------------------------------------
 
+def _nav_priority(path: Path) -> int:
+    """Source preference for a NAV file: lower sorts first.
+
+    Downstream (pipeline.run) reads only nav_files[0] per day, so the preferred
+    multi-GNSS product must sort ahead of the EUREF/GOP one. CDDIS products are
+    ordered by their position in CDDIS_NAV_PRODUCTS; everything else trails.
+    """
+    for i, prod in enumerate(CDDIS_NAV_PRODUCTS):
+        if prod in path.name:
+            return i
+    return len(CDDIS_NAV_PRODUCTS)
+
+
 def _get_local_nav_files(nav_dir: Path, year: int, doy: int) -> list[Path]:
-    """Return already-downloaded NAV files for a given year/DOY (RINEX 2 and 3 patterns)."""
+    """Return already-downloaded NAV files for a given year/DOY (RINEX 2 and 3 patterns).
+
+    Sorted by source preference so the best multi-GNSS product is first.
+    """
     yy = str(year)[-2:]
     files = list(nav_dir.glob(f"*BRDC*{year}*{doy:03d}*"))
+    files.extend(nav_dir.glob(f"*BRDM*{year}*{doy:03d}*"))
     files.extend(nav_dir.glob(f"brdc{doy:03d}0.{yy}*"))
-    return files
+    return sorted(set(files), key=_nav_priority)
+
+
+def _download_nav_cddis(year: int, doy: int, nav_dir: Path) -> list[Path]:
+    """Download the preferred multi-GNSS BRDC product from CDDIS (anonymous FTPS).
+
+    Tries each product in CDDIS_NAV_PRODUCTS order and stops at the first that
+    downloads successfully. CDDIS allows anonymous FTPS login (no Earthdata
+    credentials needed for this archive path).
+    """
+    yy = str(year)[-2:]
+    remote_dir = f"/gnss/data/daily/{year}/{doy:03d}/{yy}p/"
+    nav_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ftp = ftplib.FTP_TLS(CDDIS_HOST, timeout=CDDIS_TIMEOUT)
+        ftp.login()
+        ftp.prot_p()
+        ftp.cwd(remote_dir)
+    except Exception as e:
+        logger.warning(f"NAV CDDIS connect/cwd error {year}/{doy:03d}: {e}")
+        return []
+
+    downloaded: list[Path] = []
+    try:
+        for prod in CDDIS_NAV_PRODUCTS:
+            fname = f"{prod}_{year}{doy:03d}0000_01D_MN.rnx.gz"
+            local_path = nav_dir / fname
+            if local_path.exists():
+                downloaded.append(local_path)
+                break
+            try:
+                with open(local_path, "wb") as f:
+                    ftp.retrbinary(f"RETR {fname}", f.write)
+                logger.debug(f"[nav cddis] {fname}")
+                downloaded.append(local_path)
+                break
+            except Exception as e:
+                logger.debug(f"[nav cddis miss] {fname}: {e}")
+                local_path.unlink(missing_ok=True)
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+    if not downloaded:
+        logger.warning(f"No CDDIS NAV product available for {year} DOY {doy:03d}.")
+    return downloaded
 
 
 def _download_nav_euref(year: int, doy: int, nav_dir: Path) -> list[Path]:
@@ -251,11 +320,25 @@ def _download_nav_euref(year: int, doy: int, nav_dir: Path) -> list[Path]:
 def ensure_nav(year: int, doy: int, nav_dir: Path) -> list[Path]:
     """
     Return local NAV files for a given year/DOY, downloading if needed.
-    Tries EUREF first, then BKG fallback.
+
+    Source preference: CDDIS multi-GNSS (IGS combined / DLR merged) first, then
+    EUREF EPN, then BKG. CDDIS products avoid the cross-PRN BeiDou-3
+    mis-attribution present in the EUREF/GOP product. pipeline.run reads only
+    the first returned file, and _get_local_nav_files orders by source
+    preference, so a cached CDDIS file always wins over a cached GOP one.
     """
     nav_files = _get_local_nav_files(nav_dir, year, doy)
+    # Attempt CDDIS unless a CDDIS product is already cached. A cached GOP file
+    # alone must not short-circuit the preferred source.
+    have_cddis = bool(nav_files) and any(
+        prod in nav_files[0].name for prod in CDDIS_NAV_PRODUCTS
+    )
+    if not have_cddis:
+        logger.debug(f"Downloading preferred NAV from CDDIS for {year}/DOY {doy}...")
+        _download_nav_cddis(year, doy, nav_dir)
+        nav_files = _get_local_nav_files(nav_dir, year, doy)
     if not nav_files:
-        logger.debug(f"NAV not found for {year}/DOY {doy} — downloading from EUREF...")
+        logger.debug(f"CDDIS NAV unavailable — trying EUREF for {year}/DOY {doy}...")
         _download_nav_euref(year, doy, nav_dir)
         nav_files = _get_local_nav_files(nav_dir, year, doy)
     if not nav_files:

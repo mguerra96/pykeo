@@ -403,7 +403,7 @@ def run(
                             for p in result[1]:
                                 p.unlink(missing_ok=True)
                                 fh.write(p.name + "\n")
-                                logger.info(f"[deleted, logged] {p.name}")
+                                logger.debug(f"[deleted, logged] {p.name}")
                     elif result is not None:
                         tmp_paths.append(result)
                     pbar.update()

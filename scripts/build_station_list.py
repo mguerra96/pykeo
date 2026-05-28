@@ -43,7 +43,7 @@ import json
 import logging
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout, as_completed
 from datetime import date, datetime
 from pathlib import Path
 
@@ -86,7 +86,7 @@ LON_MIN, LON_MAX =  0.0, 20.0
 DEFAULT_N_STATIONS = 300
 
 FTP_TIMEOUT_LIST     = 120
-FTP_TIMEOUT_DOWNLOAD = 120
+FTP_TIMEOUT_DOWNLOAD = 5
 
 MAP_PANEL_HEIGHT = 9
 MAP_DPI          = 150
@@ -125,7 +125,7 @@ def _run_crx2rnx(p: Path) -> Path | None:
         log.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
         return p
     try:
-        subprocess.run([str(CRX2RNX), str(p)], capture_output=True, check=False)
+        subprocess.run([str(CRX2RNX), "-f", "-d", str(p)], capture_output=True, check=False, timeout=5)
         out = (
             p.with_suffix(p.suffix[:-1] + "O")
             if _is_hatanaka_rnx2(p)
@@ -135,6 +135,9 @@ def _run_crx2rnx(p: Path) -> Path | None:
             p.unlink(missing_ok=True)
             return out
         log.warning(f"crx2rnx produced no output for {p.name}")
+    except subprocess.TimeoutExpired:
+        log.warning(f"crx2rnx timed out on {p.name} — skipping")
+        p.unlink(missing_ok=True)
     except Exception as e:
         log.warning(f"crx2rnx error on {p.name}: {e}")
     return None
@@ -251,12 +254,23 @@ def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str) -> Pa
     if final_path.exists():
         return final_path
     raw_path = local_dir / fname
-    try:
+
+    def _do_transfer() -> None:
         with ftplib.FTP(host, timeout=FTP_TIMEOUT_DOWNLOAD) as ftp:
             ftp.login()
             ftp.cwd(remote_dir)
+            ftp.sock.settimeout(FTP_TIMEOUT_DOWNLOAD)
             with open(raw_path, "wb") as f:
                 ftp.retrbinary(f"RETR {fname}", f.write)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_do_transfer)
+            fut.result(timeout=FTP_TIMEOUT_DOWNLOAD)
+    except FutTimeout:
+        log.warning(f"[timeout] {fname} — transfer stalled after {FTP_TIMEOUT_DOWNLOAD}s")
+        raw_path.unlink(missing_ok=True)
+        return None
     except Exception as e:
         log.warning(f"[fail] {fname}: {e}")
         raw_path.unlink(missing_ok=True)
