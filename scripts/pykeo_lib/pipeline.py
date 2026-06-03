@@ -2,9 +2,12 @@
 Per-station TEC calibration pipeline: obs grouping, SG detrending, run().
 """
 
+import contextlib
 import datetime as dt
+import gzip
 import logging
 import os
+import tempfile
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -84,6 +87,59 @@ def _savitzky_golay_detrend(
     return pl.concat(results)
 
 
+@contextlib.contextmanager
+def _suppress_stderr():
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_fd = os.dup(2)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    try:
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+
+
+def _strip_leap_seconds(p: Path) -> Path:
+    raw = p.read_bytes()
+    is_gz = raw[:2] == b"\x1f\x8b"
+    text = gzip.decompress(raw).decode("latin-1") if is_gz else raw.decode("latin-1")
+    cleaned = "\n".join(
+        line for line in text.splitlines()
+        if "LEAP SECONDS" not in line
+    ) + "\n"
+    data = gzip.compress(cleaned.encode("latin-1")) if is_gz else cleaned.encode("latin-1")
+    suffix = ".rnx.gz" if is_gz else ".rnx"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode="wb") as tmp:
+        tmp.write(data)
+        return Path(tmp.name)
+
+
+def _read_rinex_obs_safe(p: Path):
+    """Call read_rinex_obs, retrying once after stripping a malformed LEAP SECONDS header."""
+    try:
+        with _suppress_stderr():
+            return read_rinex_obs(str(p))
+    except BaseException as exc:
+        if type(exc).__name__ != "PanicException":
+            raise
+
+    tmp_path = _strip_leap_seconds(p)
+    try:
+        with _suppress_stderr():
+            result = read_rinex_obs(str(tmp_path))
+        logger.warning(f"{p.name}: malformed LEAP SECONDS header stripped and re-parsed successfully")
+        return result
+    except BaseException as exc2:
+        if type(exc2).__name__ != "PanicException":
+            raise
+        raise RuntimeError(
+            f"{p.name}: RINEX obs parser failed even after stripping LEAP SECONDS header"
+        ) from exc2
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def process_station(
     obs_paths: list[Path],
     glonass_channels: dict,
@@ -109,7 +165,7 @@ def process_station(
             if not p.exists():
                 logger.warning(f"[{label}] obs file missing on disk, skipping: {p.name}")
                 continue
-            df_i, rp, rv = read_rinex_obs(str(p))
+            df_i, rp, rv = _read_rinex_obs_safe(p)
             frames.append(df_i)
             rec_pos, rinex_version = rp, rv
         if not frames:
