@@ -172,8 +172,7 @@ python orchestrator.py --year 2017 --keo-only --exclude-sv R09 R12
 4. Per station in parallel: filter GLONASS SVs with no valid channel → extract arcs → compute STEC/VTEC → Savitzky-Golay detrend → compute IPP → write result to `_tmp/`
 5. Main process reads per-station parquets, concatenates, deletes temp files, saves outputs
 
-**Skip logic (year mode):** a day is skipped only when ALL three outputs already exist:
-`tec_<date>.parquet`, `keogram_<date>.png`, and `keogram_grid_<date>.parquet`.
+**Skip logic (year mode):** a day is skipped when the keogram image `keogram_<date>.png` already exists.
 
 **Obs-file lifecycle (rolling 3-day window):**
 - Each day D downloads D-1, D, and D+1 obs on demand

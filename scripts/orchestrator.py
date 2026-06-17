@@ -145,11 +145,8 @@ def _append_csv_row(csv_path: Path, row: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _all_outputs_exist(date_str: str, tec_dir: Path, keo_dir: Path, mat_dir: Path) -> bool:
-    """Return True if keogram PNG and grid parquet both exist for the given date string."""
-    return (
-        (keo_dir / f"keogram_{date_str}.png").exists()
-        and (mat_dir / f"keogram_grid_{date_str}.parquet").exists()
-    )
+    """Return True if the keogram PNG exists for the given date string."""
+    return (keo_dir / f"keogram_{date_str}.png").exists()
 
 
 def process_day(
