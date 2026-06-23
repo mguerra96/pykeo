@@ -30,6 +30,11 @@ from .stations import load_station_networks
 
 logger = logging.getLogger(__name__)
 
+# Max obs networks to list/download concurrently. Listings are latency-bound,
+# so several in parallel hides per-network round-trips; the per-network download
+# fan-out is scaled down so total simultaneous FTP connections stay bounded.
+MAX_CONCURRENT_NETWORKS = 6
+
 
 # ---------------------------------------------------------------------------
 # Low-level FTP helpers
@@ -181,24 +186,43 @@ def download_obs_gnssgiving(
         f"{len(networks_to_query)} network(s) → {sorted(networks_to_query)}"
     )
 
-    downloaded: list[Path] = []
-    for network, base_path in networks_to_query.items():
+    def _fetch_network(network: str, base_path: str, per_net_workers: int) -> list[Path]:
         remote_dir = f"{base_path}/{year}/{doy:03d}"
         logger.debug(f"[{network}] listing {remote_dir} (hosts: {GNSSGIVING_HOSTS})")
         all_files, host = _list_ftp_dir_failover(GNSSGIVING_HOSTS, remote_dir)
         if not all_files:
             logger.warning(f"No data for {network} for DOY {doy:03d} ({input_date}).")
-            continue
+            return []
 
         targets = _filter_obs_filenames(all_files, stations_upper)
         if not targets:
             logger.debug(f"[{network}] No matching files for {input_date}.")
-            continue
+            return []
 
         logger.debug(f"[{network}] {len(targets)} files to download from {host}")
-        downloaded.extend(
-            _download_parallel(targets, remote_dir, local_dir, host, max_workers)
-        )
+        return _download_parallel(targets, remote_dir, local_dir, host, per_net_workers)
+
+    # Process networks concurrently: each does a serial FTP listing then a
+    # parallel per-file download, so overlapping networks hides their listing
+    # latency and keeps more transfers in flight. FTP listings are cheap and
+    # latency-bound, so we allow several networks to run at once, while keeping
+    # the per-network download fan-out so the total simultaneous connections
+    # (n_net_workers * per_net_workers) stays near `max_workers` and the server
+    # doesn't throttle or refuse us.
+    downloaded: list[Path] = []
+    n_net_workers   = min(len(networks_to_query), MAX_CONCURRENT_NETWORKS)
+    per_net_workers = max(1, max_workers // n_net_workers)
+    with ThreadPoolExecutor(max_workers=n_net_workers) as pool:
+        futures = {
+            pool.submit(_fetch_network, net, base, per_net_workers): net
+            for net, base in networks_to_query.items()
+        }
+        for fut in as_completed(futures):
+            net = futures[fut]
+            try:
+                downloaded.extend(fut.result())
+            except Exception as e:
+                logger.warning(f"[{net}] network download failed: {e}")
 
     return downloaded
 

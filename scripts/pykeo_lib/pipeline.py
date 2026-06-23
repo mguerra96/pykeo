@@ -7,6 +7,7 @@ import datetime as dt
 import gzip
 import logging
 import os
+import re
 import tempfile
 import time
 import warnings
@@ -140,6 +141,65 @@ def _read_rinex_obs_safe(p: Path):
         tmp_path.unlink(missing_ok=True)
 
 
+# Matches the epoch date field of a RINEX-3 NAV record:
+#   "G01 2017 01 00 06 00 00 ..."  ->  groups (sv-prefix, YYYY, MM, DD)
+# Some IGS BRDC files write the midnight-boundary day as "DD = 00" (e.g.
+# "2017 01 00" meaning the instant rolling out of 2016-12-31), which is not a
+# valid Gregorian date and panics the Rust parser. We roll such records back to
+# the real previous day, preserving the fixed-width "YYYY MM DD" layout.
+_NAV_DAY_ZERO_RE = re.compile(r"^([A-Z]\d{2} )(\d{4}) (\d{2}) 00( )")
+
+
+def _fix_nav_day_zero(p: Path) -> Path:
+    """Rewrite NAV epoch records with an invalid 'day 00' to the previous day."""
+    raw = p.read_bytes()
+    is_gz = raw[:2] == b"\x1f\x8b"
+    text = gzip.decompress(raw).decode("latin-1") if is_gz else raw.decode("latin-1")
+
+    def _repl(m: "re.Match") -> str:
+        prefix, year, month, tail = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        real = dt.date(year, month, 1) - dt.timedelta(days=1)  # day-0 of (y,m) → last day of prev month
+        return f"{prefix}{real.year:04d} {real.month:02d} {real.day:02d}{tail}"
+
+    cleaned = "\n".join(_NAV_DAY_ZERO_RE.sub(_repl, line) for line in text.splitlines()) + "\n"
+    data = gzip.compress(cleaned.encode("latin-1")) if is_gz else cleaned.encode("latin-1")
+    suffix = ".rnx.gz" if is_gz else ".rnx"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode="wb") as tmp:
+        tmp.write(data)
+        return Path(tmp.name)
+
+
+def _read_rinex_nav_safe(p: Path):
+    """
+    Call read_rinex_nav, retrying once after fixing 'day 00' epoch dates that
+    panic the Rust parser ("invalid Gregorian date"). Returns None if the file
+    still cannot be parsed; one bad NAV file out of D-1/D/D+1 is non-fatal, the
+    caller proceeds as long as at least one parsed.
+    """
+    try:
+        with _suppress_stderr():
+            return read_rinex_nav(str(p))
+    except BaseException as exc:
+        if type(exc).__name__ != "PanicException":
+            raise
+
+    tmp_path = _fix_nav_day_zero(p)
+    try:
+        with _suppress_stderr():
+            result = read_rinex_nav(str(tmp_path))
+        logger.warning(f"{p.name}: fixed invalid 'day 00' NAV epochs and re-parsed successfully")
+        return result
+    except BaseException as exc2:
+        if type(exc2).__name__ != "PanicException":
+            raise
+        logger.warning(
+            f"{p.name}: RINEX nav parser still panicked after day-00 fix ({exc2}); skipping this NAV file"
+        )
+        return None
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def process_station(
     obs_paths: list[Path],
     glonass_channels: dict,
@@ -198,8 +258,16 @@ def process_station(
 
         df_lc = calculate_linear_combinations(df_obs, ctx=ctx)
 
-        df_sat_coords = pl.read_parquet(sat_coords_path)
-        df_coords = df_sat_coords.join(df_lc.select(["sv", "epoch"]), on=["sv", "epoch"], how="inner")
+        # Only this station's observed (sv, epoch) pairs are needed from the
+        # shared sat-coords table. Scan lazily and inner-join so Polars prunes
+        # columns/row-groups instead of every worker materializing all ~Nk rows.
+        # Keys mirror df_lc exactly (no dedup) to preserve the original join's
+        # row multiplicity.
+        df_coords = (
+            pl.scan_parquet(sat_coords_path)
+            .join(df_lc.select(["sv", "epoch"]).lazy(), on=["sv", "epoch"], how="inner")
+            .collect()
+        )
         df_geom   = df_lc.join(df_coords, on=["sv", "epoch"], how="left")
         df_ipp    = calculate_ipp(
             df_geom, ctx=ctx,
@@ -381,7 +449,9 @@ def run(
         y, doy = _date_to_year_doy(d)
         nav_files = ensure_nav(y, doy, nav_dir)
         if nav_files:
-            nav_dicts.append(read_rinex_nav(str(nav_files[0])))
+            nav_dict = _read_rinex_nav_safe(nav_files[0])
+            if nav_dict is not None:
+                nav_dicts.append(nav_dict)
     if not nav_dicts:
         logger.error("Could not obtain NAV files. Aborting.")
         return pl.DataFrame()

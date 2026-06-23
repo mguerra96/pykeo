@@ -19,13 +19,13 @@ python orchestrator.py --year 2025 --stations-file network/station_lists/station
 python orchestrator.py --year 2025 --keo-only
 python orchestrator.py --date 2025-06-15 --keo-only
 
-Outputs (relative to --work-dir)
----------------------------------
-  results/tec_data/tec_<date>.parquet
-  results/keo_image/keogram_<date>.png
-  results/keo_mat/keogram_grid_<date>.parquet
-  orchestrator_<year|date>.log
-  pipeline_log_<year|date>.csv      (--year mode only)
+Outputs
+-------
+  D:\pykeo\results\tec_data\tec_<date>.parquet
+  D:\pykeo\results\keo_mat\keogram_grid_<date>.parquet
+  results/keo_image/keogram_<date>.png            (relative to --work-dir)
+  orchestrator_<year|date>.log                    (relative to --work-dir)
+  pipeline_log_<year|date>.csv                    (--year mode only)
 """
 
 import argparse
@@ -40,8 +40,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from concurrent.futures import ThreadPoolExecutor, Future
+
 from pykeo_lib.constants import DEFAULT_LON_SPAN
-from pykeo_lib.download import _date_to_year_doy
+from pykeo_lib.download import _date_to_year_doy, download_obs_gnssgiving
 from pykeo_lib.pipeline import run
 from pykeo_lib.stations import ensure_station_networks, station_ids_from_networks
 
@@ -95,6 +97,38 @@ def _delete_obs_day(obs_dir: Path, target_date: date, logger: logging.Logger) ->
     )
     if deleted:
         logger.info(f"  Deleted {deleted} obs file(s) for {target_date} (DOY {doy:03d})")
+
+
+def _prefetch_obs(
+    next_date: date,
+    stations: list[str] | None,
+    obs_dir: Path,
+    work_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    """
+    Download obs for *next_date*'s D-1/D/D+1 window into obs_dir.
+
+    Runs in a background thread while the current day calibrates. Files already
+    on disk are skipped by the downloader, so this only fetches the one new day
+    (next_date + 1) that the current window doesn't already cover. Errors are
+    swallowed — the main loop's own download call is the source of truth and
+    will re-fetch anything missing.
+    """
+    try:
+        t0 = time.perf_counter()
+        for d in (next_date - dt.timedelta(days=1), next_date, next_date + dt.timedelta(days=1)):
+            fallback = None
+            if d.month == 12 and d.day == 31:
+                fallback = next_date.year
+            elif d.month == 1 and d.day == 1:
+                fallback = next_date.year
+            download_obs_gnssgiving(
+                d, stations, obs_dir, work_dir=work_dir, fallback_year=fallback
+            )
+        logger.info(f"  Prefetch for {next_date} done in {time.perf_counter() - t0:.0f}s")
+    except Exception as e:
+        logger.warning(f"  Prefetch for {next_date} failed (will fetch in main loop): {e}")
 
 
 def _cleanup_obs_dir(obs_dir: Path, start_date: date, logger: logging.Logger) -> None:
@@ -255,9 +289,9 @@ def orchestrate_year(
     logger   = _setup_logging(log_path)
 
     obs_dir = work_dir / "tec_data" / "obs"
-    tec_dir = work_dir / "results" / "tec_data"
+    tec_dir = Path(r"D:\pykeo\results\tec_data")
     keo_dir = work_dir / "results" / "keo_image"
-    mat_dir = work_dir / "results" / "keo_mat"
+    mat_dir = Path(r"D:\pykeo\results\keo_mat")
     for d in (obs_dir, tec_dir, keo_dir, mat_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -281,37 +315,70 @@ def orchestrate_year(
     success_count = 0
     fail_count    = 0
 
-    for target_date in days:
-        date_str  = target_date.isoformat()
-        date_prev = target_date - dt.timedelta(days=1)
+    # Single background worker that prefetches the next day's obs while the
+    # current day calibrates, overlapping the (network-bound) download stage
+    # with the (CPU-bound) calibration stage. Disabled for keo_only (no DLs).
+    prefetch_pool: ThreadPoolExecutor | None = None
+    pending: Future | None = None
+    if not keo_only:
+        prefetch_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch")
 
-        if not keo_only and _all_outputs_exist(date_str, tec_dir, keo_dir, mat_dir):
-            logger.debug(f"[SKIP] {date_str} — all outputs exist.")
-            _delete_obs_day(obs_dir, target_date - dt.timedelta(days=2), logger)
-            success_count += 1
-            continue
-
-        ok = process_day(
-            target_date=target_date,
-            work_dir=work_dir,
-            tec_dir=tec_dir,
-            keo_dir=keo_dir,
-            mat_dir=mat_dir,
-            stations=stations,
-            logger=logger,
-            csv_path=csv_path,
-            keo_only=keo_only,
-            n_stations_target=n_stations,
-            exclude_sv=exclude_sv,
+    def _maybe_prefetch(idx: int) -> None:
+        """Submit a prefetch for days[idx] if it exists and still needs processing."""
+        nonlocal pending
+        if prefetch_pool is None or idx >= len(days):
+            return
+        nxt = days[idx]
+        if _all_outputs_exist(nxt.isoformat(), tec_dir, keo_dir, mat_dir):
+            return  # next day already done — nothing to fetch
+        pending = prefetch_pool.submit(
+            _prefetch_obs, nxt, stations, obs_dir, work_dir, logger
         )
 
-        if ok:
-            success_count += 1
-        else:
-            fail_count += 1
+    try:
+        for i, target_date in enumerate(days):
+            date_str  = target_date.isoformat()
+            date_prev = target_date - dt.timedelta(days=1)
 
-        if not keo_only:
-            _delete_obs_day(obs_dir, date_prev, logger)
+            if not keo_only and _all_outputs_exist(date_str, tec_dir, keo_dir, mat_dir):
+                logger.debug(f"[SKIP] {date_str} — all outputs exist.")
+                _delete_obs_day(obs_dir, target_date - dt.timedelta(days=2), logger)
+                success_count += 1
+                continue
+
+            # Make sure any in-flight prefetch for *this* day has finished so its
+            # obs files are on disk before run() looks for them.
+            if pending is not None:
+                pending.result()
+                pending = None
+
+            # Kick off the next day's download to overlap with this day's calibration.
+            _maybe_prefetch(i + 1)
+
+            ok = process_day(
+                target_date=target_date,
+                work_dir=work_dir,
+                tec_dir=tec_dir,
+                keo_dir=keo_dir,
+                mat_dir=mat_dir,
+                stations=stations,
+                logger=logger,
+                csv_path=csv_path,
+                keo_only=keo_only,
+                n_stations_target=n_stations,
+                exclude_sv=exclude_sv,
+            )
+
+            if ok:
+                success_count += 1
+            else:
+                fail_count += 1
+
+            if not keo_only:
+                _delete_obs_day(obs_dir, date_prev, logger)
+    finally:
+        if prefetch_pool is not None:
+            prefetch_pool.shutdown(wait=True)
 
     logger.info("=" * 60)
     logger.info(f"Orchestrator finished — {success_count} ok, {fail_count} failed")
@@ -335,9 +402,9 @@ def orchestrate_date(
     logger   = _setup_logging(log_path)
 
     obs_dir = work_dir / "tec_data" / "obs"
-    tec_dir = work_dir / "results" / "tec_data"
+    tec_dir = Path(r"D:\pykeo\results\tec_data")
     keo_dir = work_dir / "results" / "keo_image"
-    mat_dir = work_dir / "results" / "keo_mat"
+    mat_dir = Path(r"D:\pykeo\results\keo_mat")
     for d in (obs_dir, tec_dir, keo_dir, mat_dir):
         d.mkdir(parents=True, exist_ok=True)
 
