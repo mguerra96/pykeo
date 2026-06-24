@@ -23,7 +23,21 @@ def _run_crx2rnx(p: Path) -> Path | None:
         logger.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
         return p
     try:
-        subprocess.run([str(CRX2RNX), "-f", "-d", str(p)], capture_output=True, check=False, timeout=5)
+        # Use DEVNULL rather than capture_output: capture_output opens OS pipes
+        # whose handles can be inherited by ProcessPoolExecutor worker spawns, so
+        # a timed-out crx2rnx leaves those pipes open in the workers and wedges
+        # the run at 0% CPU. DEVNULL has no pipe to leak, and
+        # CREATE_NEW_PROCESS_GROUP isolates the timeout-kill to crx2rnx alone.
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.run(
+            [str(CRX2RNX), "-f", "-d", str(p)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            creationflags=creationflags,
+        )
         out = p.with_suffix(p.suffix[:-1] + "O") if _is_hatanaka_rinex2(p) else p.with_suffix(".rnx")
         if out.exists():
             p.unlink(missing_ok=True)

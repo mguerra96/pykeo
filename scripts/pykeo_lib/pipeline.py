@@ -11,7 +11,7 @@ import re
 import tempfile
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -49,6 +49,12 @@ from .download import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Max wall-clock to wait for the *next* worker to finish during calibration.
+# A healthy station takes a few seconds; this only trips if a worker has wedged
+# (e.g. a native-parser hang), so the run can abandon it and merge partials
+# instead of freezing the whole year. Override via PYKEO_STATION_TIMEOUT.
+STATION_TIMEOUT_S = float(os.environ.get("PYKEO_STATION_TIMEOUT", 600))
 
 
 def _level_vtec_jumps(df: pl.DataFrame, threshold: float = VTEC_JUMP_THRESHOLD) -> pl.DataFrame:
@@ -503,20 +509,26 @@ def run(
     logger.info(f"Calibrating {len(station_groups)} stations with {n_workers} workers...")
     tmp_paths: list[Path] = []
 
+    pool = ProcessPoolExecutor(max_workers=n_workers)
     try:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(
-                    process_station,
-                    paths, glonass_channels,
-                    sat_coords_path, epoch_filter, epoch_clip,
-                    dict(pipeline_kwargs),
-                    tmp_dir,
-                ): paths
-                for paths in station_groups
-            }
-            with tqdm(total=len(futures), desc="Calibrating", unit="station") as pbar:
-                for fut in as_completed(futures):
+        futures = {
+            pool.submit(
+                process_station,
+                paths, glonass_channels,
+                sat_coords_path, epoch_filter, epoch_clip,
+                dict(pipeline_kwargs),
+                tmp_dir,
+            ): paths
+            for paths in station_groups
+        }
+        # Per-station hard cap: a single wedged worker (e.g. a native-parser
+        # hang) must not freeze the whole year run. as_completed yields a future
+        # only once it's done, so the timeout bounds the wait for the *next*
+        # completion across all in-flight workers; on trip we abandon whatever is
+        # still pending and proceed with the stations that did finish.
+        with tqdm(total=len(futures), desc="Calibrating", unit="station") as pbar:
+            try:
+                for fut in as_completed(futures, timeout=STATION_TIMEOUT_S):
                     try:
                         result = fut.result()
                     except Exception as e:
@@ -533,15 +545,24 @@ def run(
                     elif result is not None:
                         tmp_paths.append(result)
                     pbar.update()
+            except FuturesTimeout:
+                n_pending = sum(1 for f in futures if not f.done())
+                logger.error(
+                    f"Calibration stalled: no worker finished within "
+                    f"{STATION_TIMEOUT_S:.0f}s; abandoning {n_pending} pending "
+                    f"station(s) and proceeding with {len(tmp_paths)} done."
+                )
     except Exception as e:
         logger.error(f"ProcessPoolExecutor failed (likely OOM): {e}")
-        # Return whatever partial results were collected before the crash
-        if not tmp_paths:
-            sat_coords_path.unlink(missing_ok=True)
-            return pl.DataFrame()
+    finally:
+        # Don't wait on wedged workers (shutdown(wait=True) would re-block);
+        # cancel_futures drops anything not yet started and we tear down without
+        # joining so a hung worker can't freeze the cleanup.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     if not tmp_paths:
-        logger.error("No data produced after calibration.")
+        logger.error("No data produced after calibration (pool failure or stall).")
+        sat_coords_path.unlink(missing_ok=True)
         return pl.DataFrame()
 
     frames = [pl.read_parquet(p) for p in tmp_paths]
