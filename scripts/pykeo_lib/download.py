@@ -1,14 +1,14 @@
 """
 FTP download helpers for RINEX observation and navigation files.
 
-Obs: gnssgiving FTP (CONTINUOUS/30s networks).
-Nav: CDDIS multi-GNSS BRDC (IGS combined / DLR merged), with EUREF and BKG
-     fallback.
+Obs: generic FTP helpers used by the obs sources in sources.py.
+Nav: CDDIS multi-GNSS BRDC (IGS combined / DLR merged), with EUREF
+     fallback. Both are public, so NAV works for every obs source.
 """
 
 import ftplib
 import logging
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -22,18 +22,10 @@ from .constants import (
     FTP_HOST,
     FTP_TIMEOUT_DOWNLOAD,
     FTP_TIMEOUT_LIST,
-    FTP_TIMEOUT_TRANSFER,
-    GNSSGIVING_HOSTS,
 )
-from .decompress import decompress, expected_final_path
-from .stations import load_station_networks
+from .decompress import can_decompress, decompress, expected_final_path
 
 logger = logging.getLogger(__name__)
-
-# Max obs networks to list/download concurrently. Listings are latency-bound,
-# so several in parallel hides per-network round-trips; the per-network download
-# fan-out is scaled down so total simultaneous FTP connections stay bounded.
-MAX_CONCURRENT_NETWORKS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +37,12 @@ def _date_to_year_doy(d: date) -> tuple[int, int]:
     return d.year, d.timetuple().tm_yday
 
 
-def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
-    """List filenames in an FTP directory; returns empty list on any error."""
+def _list_ftp_dir(host: str, remote_dir: str) -> list[str] | None:
+    """List filenames in an FTP directory.
+
+    Returns [] when the server says the directory is missing (550: no data),
+    None when the server could not be asked (timeout, refused, 4xx throttling).
+    """
     try:
         with ftplib.FTP(host, timeout=FTP_TIMEOUT_LIST) as ftp:
             ftp.login()
@@ -57,17 +53,23 @@ def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
         return []
     except Exception as e:
         logger.debug(f"FTP listing failed {host}{remote_dir}: {e}")
-        return []
+        return None
 
 
-def _list_ftp_dir_failover(hosts: tuple[str, ...], remote_dir: str) -> tuple[list[str], str | None]:
-    """Try each host in order; return (files, host_that_worked) or ([], None)."""
+def _list_ftp_dir_failover(hosts: tuple[str, ...], remote_dir: str) -> tuple[list[str] | None, str | None]:
+    """Try each host in order; return (files, host_that_worked).
+
+    files is [] if at least one host answered "no data", None if no host was reachable.
+    """
+    result = None
     for host in hosts:
         files = _list_ftp_dir(host, remote_dir)
         if files:
             return files, host
+        if files is not None:
+            result = []
         logger.debug(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
-    return [], None
+    return result, None
 
 
 def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str = FTP_HOST) -> Path | None:
@@ -104,6 +106,7 @@ def _filter_obs_filenames(
         f for f in all_files
         if (f.endswith(".gz") or f.endswith(".Z"))
         and (stations_upper is None or f[:4].upper() in stations_upper)
+        and can_decompress(f)
     ]
 
 
@@ -125,105 +128,13 @@ def _download_parallel(
             for fut in as_completed(futures):
                 fname = futures[fut]
                 try:
-                    result = fut.result(timeout=FTP_TIMEOUT_TRANSFER)
-                except TimeoutError:
-                    logger.warning(f"[timeout] {fname} — download exceeded {FTP_TIMEOUT_TRANSFER}s, skipping")
-                    fut.cancel()
-                    result = None
+                    result = fut.result()
                 except Exception as e:
                     logger.warning(f"[error] {fname}: {e}")
                     result = None
                 if result is not None:
                     downloaded.append(result)
                 bar.update(1)
-    return downloaded
-
-
-# ---------------------------------------------------------------------------
-# Obs downloader (public)
-# ---------------------------------------------------------------------------
-
-def download_obs_gnssgiving(
-    input_date: date,
-    stations: list[str] | None,
-    local_dir: Path,
-    max_workers: int = 12,
-    work_dir: Path = Path("."),
-    fallback_year: int | None = None,
-) -> list[Path]:
-    """
-    Download observation files for one day from gnssgiving networks.
-
-    Uses station_networks_{year}.json to map station IDs to network paths.
-    Falls back to fallback_year JSON when input_date is a cross-year boundary
-    day (D-1 of Jan 1 or D+1 of Dec 31) and the primary year JSON is absent.
-    Raises FileNotFoundError if neither JSON exists.
-    """
-    year, doy = _date_to_year_doy(input_date)
-    local_dir.mkdir(parents=True, exist_ok=True)
-    stations_upper = {s.upper() for s in stations} if stations else None
-
-    sta_net_map = load_station_networks(year, work_dir, fallback_year=fallback_year)
-    if sta_net_map is None:
-        json_path = work_dir / "network" / "station_lists" / f"station_networks_{year}.json"
-        raise FileNotFoundError(
-            f"station_networks_{year}.json not found at {json_path}. "
-            f"Run: python build_station_list.py --date {year}-06-21"
-        )
-
-    if stations_upper is not None:
-        needed_networks = {net for sta, net in sta_net_map.items() if sta in stations_upper}
-    else:
-        needed_networks = set(sta_net_map.values())
-
-    if not needed_networks:
-        logger.debug("[gnssgiving] no matching networks for the requested stations — skipping")
-        return []
-
-    networks_to_query = {net: f"/CONTINUOUS/30s/{net}" for net in needed_networks}
-    logger.debug(
-        f"[gnssgiving] station_networks_{year}.json: "
-        f"{len(networks_to_query)} network(s) → {sorted(networks_to_query)}"
-    )
-
-    def _fetch_network(network: str, base_path: str, per_net_workers: int) -> list[Path]:
-        remote_dir = f"{base_path}/{year}/{doy:03d}"
-        logger.debug(f"[{network}] listing {remote_dir} (hosts: {GNSSGIVING_HOSTS})")
-        all_files, host = _list_ftp_dir_failover(GNSSGIVING_HOSTS, remote_dir)
-        if not all_files:
-            logger.warning(f"No data for {network} for DOY {doy:03d} ({input_date}).")
-            return []
-
-        targets = _filter_obs_filenames(all_files, stations_upper)
-        if not targets:
-            logger.debug(f"[{network}] No matching files for {input_date}.")
-            return []
-
-        logger.debug(f"[{network}] {len(targets)} files to download from {host}")
-        return _download_parallel(targets, remote_dir, local_dir, host, per_net_workers)
-
-    # Process networks concurrently: each does a serial FTP listing then a
-    # parallel per-file download, so overlapping networks hides their listing
-    # latency and keeps more transfers in flight. FTP listings are cheap and
-    # latency-bound, so we allow several networks to run at once, while keeping
-    # the per-network download fan-out so the total simultaneous connections
-    # (n_net_workers * per_net_workers) stays near `max_workers` and the server
-    # doesn't throttle or refuse us.
-    downloaded: list[Path] = []
-    n_net_workers   = min(len(networks_to_query), MAX_CONCURRENT_NETWORKS)
-    per_net_workers = max(1, max_workers // n_net_workers)
-    with ThreadPoolExecutor(max_workers=n_net_workers) as pool:
-        futures = {
-            pool.submit(_fetch_network, net, base, per_net_workers): net
-            for net, base in networks_to_query.items()
-        }
-        for fut in as_completed(futures):
-            net = futures[fut]
-            try:
-                downloaded.extend(fut.result())
-            except Exception as e:
-                logger.warning(f"[{net}] network download failed: {e}")
-
     return downloaded
 
 
@@ -253,7 +164,8 @@ def _get_local_nav_files(nav_dir: Path, year: int, doy: int) -> list[Path]:
     files = list(nav_dir.glob(f"*BRDC*{year}*{doy:03d}*"))
     files.extend(nav_dir.glob(f"*BRDM*{year}*{doy:03d}*"))
     files.extend(nav_dir.glob(f"brdc{doy:03d}0.{yy}*"))
-    return sorted(set(files), key=_nav_priority)
+    # .part = unfinished download (see _download_nav_*), never read it
+    return sorted({f for f in files if f.suffix != ".part"}, key=_nav_priority)
 
 
 def _download_nav_cddis(year: int, doy: int, nav_dir: Path) -> list[Path]:
@@ -284,15 +196,17 @@ def _download_nav_cddis(year: int, doy: int, nav_dir: Path) -> list[Path]:
             if local_path.exists():
                 downloaded.append(local_path)
                 break
+            part_path = local_path.with_name(local_path.name + ".part")
             try:
-                with open(local_path, "wb") as f:
+                with open(part_path, "wb") as f:
                     ftp.retrbinary(f"RETR {fname}", f.write)
+                part_path.replace(local_path)
                 logger.debug(f"[nav cddis] {fname}")
                 downloaded.append(local_path)
                 break
             except Exception as e:
                 logger.debug(f"[nav cddis miss] {fname}: {e}")
-                local_path.unlink(missing_ok=True)
+                part_path.unlink(missing_ok=True)
     finally:
         try:
             ftp.quit()
@@ -313,7 +227,7 @@ def _download_nav_euref(year: int, doy: int, nav_dir: Path) -> list[Path]:
             ftp.login()
             ftp.cwd(remote_dir)
             all_files = [Path(f).name for f in ftp.nlst()]
-    except ftplib.error_perm as e:
+    except Exception as e:
         logger.warning(f"NAV EUREF FTP error {year}/BRDC: {e}")
         return []
 
@@ -328,16 +242,19 @@ def _download_nav_euref(year: int, doy: int, nav_dir: Path) -> list[Path]:
         if local_path.exists():
             downloaded.append(local_path)
             continue
+        part_path = local_path.with_name(local_path.name + ".part")
         try:
             with ftplib.FTP(FTP_HOST, timeout=60) as ftp:
                 ftp.login()
                 ftp.cwd(remote_dir)
-                with open(local_path, "wb") as f:
+                with open(part_path, "wb") as f:
                     ftp.retrbinary(f"RETR {fname}", f.write)
+            part_path.replace(local_path)
             logger.debug(f"[nav] {fname}")
             downloaded.append(local_path)
         except Exception as e:
             logger.warning(f"[nav fail] {fname}: {e}")
+            part_path.unlink(missing_ok=True)
     return downloaded
 
 
@@ -346,7 +263,7 @@ def ensure_nav(year: int, doy: int, nav_dir: Path) -> list[Path]:
     Return local NAV files for a given year/DOY, downloading if needed.
 
     Source preference: CDDIS multi-GNSS (IGS combined / DLR merged) first, then
-    EUREF EPN, then BKG. CDDIS products avoid the cross-PRN BeiDou-3
+    EUREF EPN. CDDIS products avoid the cross-PRN BeiDou-3
     mis-attribution present in the EUREF/GOP product. pipeline.run reads only
     the first returned file, and _get_local_nav_files orders by source
     preference, so a cached CDDIS file always wins over a cached GOP one.
@@ -364,11 +281,6 @@ def ensure_nav(year: int, doy: int, nav_dir: Path) -> list[Path]:
     if not nav_files:
         logger.debug(f"CDDIS NAV unavailable — trying EUREF for {year}/DOY {doy}...")
         _download_nav_euref(year, doy, nav_dir)
-        nav_files = _get_local_nav_files(nav_dir, year, doy)
-    if not nav_files:
-        logger.debug(f"EUREF NAV unavailable — trying BKG fallback for {year}/DOY {doy}...")
-        from download_nav_bkg import download_nav_bkg  # project-level helper
-        download_nav_bkg(year=year, doys=[doy], output_path=nav_dir)
         nav_files = _get_local_nav_files(nav_dir, year, doy)
     if not nav_files:
         logger.error(f"Could not obtain NAV for {year} DOY {doy}.")

@@ -1,243 +1,251 @@
-# pykeo — GNSS TEC Pipeline
+# pykeo — GNSS TEC calibration and keograms
 
-GNSS-based Total Electron Content (TEC) calibration and keogram generation for European networks (EUREF, RING, NOA, SWEPOS, ASG-EUPOS).
+pykeo turns daily RINEX observation files from a network of GNSS receivers into
+calibrated vertical Total Electron Content (vTEC) and detrended TEC (dTEC) at the
+ionospheric pierce points, and plots the dTEC as latitude–time keograms.
 
----
+For each day D it:
 
-## Directory structure
+1. reads the obs files of D-1, D and D+1 for every station (20:00 of D-1 to 04:00 of D+1,
+   so arcs that cross midnight are complete);
+2. computes satellite positions from broadcast ephemerides (GPS, Galileo, GLONASS, BeiDou)
+   and drops satellites whose orbit jumps by more than 500 km between epochs;
+3. computes ionospheric pierce points (IPP) at 300 km, keeping elevations ≥ 20°;
+4. extracts continuous arcs and calibrates TEC per arc
+   ([pytecgg](https://github.com/viventriglia/PyTECGg));
+5. removes residual vTEC jumps inside each arc, then detrends each arc with a
+   Savitzky-Golay filter and smooths the residual (dTEC);
+6. keeps day D only, writes one parquet per day and draws the keogram.
 
-```
-pykeo/                          ← project root
-│
-├── scripts/                    ← all Python scripts
-│   ├── orchestrator.py         ← sole CLI entry point
-│   ├── build_station_list.py   ← one-time station network builder
-│   ├── test_keogram_plot.py    ← interactive keogram tester (parameter experiments)
-│   └── pykeo_lib/              ← internal library package
-│       ├── constants.py
-│       ├── decompress.py
-│       ├── stations.py
-│       ├── download.py
-│       ├── pipeline.py
-│       └── keogram.py
-│
-├── tec_data/                   ← raw GNSS data (created at runtime)
-│   ├── obs/                    ← RINEX obs files (rolling 3-day window)
-│   ├── nav/                    ← NAV/BRDC files (kept for the whole run)
-│   ├── errors/                 ← obs files that caused processing errors
-│   └── _tmp/                   ← per-station temp parquets (created and deleted each day)
-│
-├── results/                    ← pipeline outputs (created at runtime)
-│   ├── tec_data/               ← tec_<date>.parquet  (full calibrated output)
-│   ├── keo_image/              ← keogram_<date>.png
-│   ├── keo_mat/                ← keogram_grid_<date>.parquet  (2-D grid for re-plotting)
-│   └── _keo_test/              ← test keograms from test_keogram_plot.py
-│
-└── network/                    ← station metadata
-    ├── station_rnx/            ← RINEX obs downloaded by build_station_list.py
-    ├── station_map/            ← stations_<year>.png  (spatial coverage map)
-    └── station_lists/          ← station_networks_<year>.json  (station→network mapping)
-```
+The method does not depend on where the data comes from. Three example data
+sources are included (public EUREF archive, your own files, INGV networks), and
+adding your own is one function — see [Data sources](#data-sources).
 
 ---
 
-## Scripts
+## Install
 
-### 1. `build_station_list.py` — build the station network
-
-Downloads one day of RINEX obs from all configured networks, reads receiver
-coordinates from the RINEX headers, optionally sub-samples stations for spatial
-coverage using farthest-point sampling, and writes a station→network JSON ready
-for `orchestrator.py`.
-
-**Networks:** EUREF (`www.epncb.oma.be`), RING, NOA, SWEPOS, ASG-EUPOS (`mga.int.ingv.it`, falling back to `gnssgiving.int.ingv.it`)
-
-**Decompression chain** applied to every downloaded file:
-`.Z` → unlzw3 (or gzip if mislabelled) → `.gz` → gzip → Hatanaka (crx2rnx.exe)
-
-RINEX 3 is always preferred over RINEX 2 when both exist for the same station.
+Python ≥ 3.11.
 
 ```
-python build_station_list.py --date 2015-06-21
-python build_station_list.py --date 2015-06-21 --workers 16
-python build_station_list.py --date 2015-06-21 --n-stations 80   # farthest-point sampling
-python build_station_list.py --date 2015-06-21 --map-only        # skip download, re-plot existing
+pip install -r requirements.txt
 ```
 
-| Argument | Default | Description |
+**pytecgg.** The minimum version is the current release. Recent fixes are on its
+`develop` branch until the next release; to use them (needs a Rust toolchain to build):
+
+```
+pip install git+https://github.com/viventriglia/PyTECGg.git@develop
+```
+
+**crx2rnx (optional).** Many archives distribute Hatanaka-compressed RINEX.
+pytecgg reads RINEX 3 Hatanaka (`.crx`) directly, but **RINEX 2 Hatanaka (`.yyD`)
+files need `crx2rnx`** from [RNXCMP](https://terras.gsi.go.jp/ja/crx2rnx.html).
+pykeo looks for `crx2rnx` on your `PATH`, then for `crx2rnx.exe` at the project root
+(a Windows build is included). Without it, RINEX 2 Hatanaka files are skipped with a
+warning. This matters mostly for older years: in 2015, about 80% of EUREF files are RINEX 2.
+
+## Quick start
+
+Process one day with three EUREF stations (about 2 minutes, a few MB of downloads).
+Create `stations.txt` with one station ID per line — `AQUI`, `AJAC`, `GENO` — then run:
+
+```
+python scripts/orchestrator.py --date 2024-06-20 --stations-file stations.txt
+```
+
+Outputs appear under `results/` (see [Outputs](#outputs)). Drop `--stations-file`
+to use all ~400 EUREF stations.
+
+---
+
+## Data sources
+
+Choose with `--source`:
+
+| `--source` | Obs files from | Who can use it |
 |---|---|---|
-| `--date` | required | Reference date (`YYYY-MM-DD`) |
-| `--workers` | 8 | Parallel download threads per network |
-| `--n-stations` | all | Keep N stations with best spatial coverage |
-| `--map-only` | false | Skip download, just re-generate the map |
+| `euref` (default) | public EUREF EPN archive (`www.epncb.oma.be`, ~400 European stations, 30 s) | anyone |
+| `local` | your own folder of RINEX files, given with `--local-dir` | anyone |
+| `ingv` | INGV gnssgiving networks (`*.int.ingv.it`) | INGV network only |
 
-**Outputs:**
-- `network/station_rnx/` — downloaded and decompressed RINEX files
-- `network/station_map/stations_<year>.png` — spatial coverage map
-- `network/station_lists/station_networks_<year>.json` — station→network mapping
+Navigation (broadcast ephemeris) files are always downloaded automatically from public
+archives: CDDIS (IGS combined `BRDC00IGS_R`, or DLR merged `BRDM00DLR_S` for older
+years), with EUREF as fallback. A day is skipped if no NAV file is available for D itself.
 
-**Station filtering:** only stations within lat 30–65°, lon 10–25° are kept;
-files for out-of-bbox stations are deleted automatically.
+### Your own files (`--source local`)
 
-> Note: `crx2rnx.exe` must be present at the project root for Hatanaka decompression.
+```
+python scripts/orchestrator.py --year 2024 --source local --local-dir path/to/my_rinex
+```
 
-If `station_networks_<year>.json` is missing when `orchestrator.py` runs, it
-invokes `build_station_list.py --date <year>-06-21` automatically.
+- One flat folder; any mix of RINEX 2 and 3, compressed (`.gz`, `.Z`, Hatanaka) or not.
+- Files need standard RINEX names: the first 4 characters are the station ID, and the
+  name contains the date (`2024172` in RINEX 3 long names, `1720.24` in RINEX 2 names).
+- The folder needs the days around the ones you process (D-1 and D+1).
+- Your folder is never modified: matching files are copied into `tec_data/obs/` and
+  decompressed there.
+
+### Writing your own source
+
+A source is one function in [scripts/pykeo_lib/sources.py](scripts/pykeo_lib/sources.py):
+
+```python
+def get_obs(day: date, stations: list[str] | None, obs_dir: Path) -> list[Path]:
+    ...
+```
+
+It puts the obs files for `day` into `obs_dir` and returns their paths (decompressed,
+standard RINEX names). `stations` limits the download to those IDs; `None` means all.
+Raise an exception when the server cannot be reached, so the day fails and is retried
+on the next run instead of being saved with missing stations; return `[]` when there is
+simply no data. Copy `obs_euref` (a single FTP folder per day) or `obs_ingv` (one folder
+per network) as a starting point, then add it to `_obs_source()` in
+[scripts/orchestrator.py](scripts/orchestrator.py).
+
+### INGV source
+
+`--source ingv` maps stations to networks with
+`network/station_lists/station_networks_<year>.json`. These files are included for
+2015–2025. For another year, `orchestrator.py` builds one automatically by running
+[scripts/build_station_list.py](scripts/build_station_list.py), which downloads one day
+from every network, keeps stations inside lat 35–60°, lon 0–20°, and picks `--n-stations`
+of them (default 300) spread out by farthest-point sampling.
 
 ---
 
-### 2. `test_keogram_plot.py` — interactive keogram tester
-
-Reads a TEC parquet and calls the same `plot_keogram` function used by the pipeline,
-with CLI flags to override every tunable constant in `constants.py`. Use this script
-to experiment with gridding and display parameters without touching the pipeline.
-Output goes to `results/_keo_test/` (separate from the pipeline's `results/keo_image/`).
+## Running
 
 ```
-# by date (resolves parquet from results/tec_data/ automatically)
-python test_keogram_plot.py --date 2015-06-21
-
-# explicit parquet path
-python test_keogram_plot.py tec_2015-06-21.parquet
-
-# override parameters
-python test_keogram_plot.py --date 2015-06-21 --clim 0.3 --gauss-sigma 1.5
-python test_keogram_plot.py --date 2015-06-21 --lon-span 10 25 --lat-range 37.5 57.5
-python test_keogram_plot.py --date 2015-06-21 --lat-step 0.1 --time-step 60
-python test_keogram_plot.py --date 2015-06-21 --exclude-sv R09 R12
-
-# also save the 2-D grid as parquet
-python test_keogram_plot.py --date 2015-06-21 --save-grid
+python scripts/orchestrator.py --date 2024-06-20                       # one day
+python scripts/orchestrator.py --year 2024                             # whole year
+python scripts/orchestrator.py --year 2024 --start-date 2024-06-01     # resume
+python scripts/orchestrator.py --year 2024 --keo-only                  # re-plot keograms only
+python scripts/orchestrator.py --year 2024 --keo-only --exclude-sv R09 # re-plot without one satellite
 ```
 
-| Argument | Default | Description |
+| Option | Default | Meaning |
 |---|---|---|
-| `PARQUET` | — | Explicit path to a TEC parquet (omit to use `--date`) |
-| `--date` | — | Date `YYYY-MM-DD`; resolves parquet from `results/tec_data/` |
-| `--out` | `results/_keo_test/keogram_<date>.png` | Output PNG path |
-| `--lon-span` | `DEFAULT_LON_SPAN` | Longitude range to include |
-| `--lat-range` | `KEO_LAT_RANGE` | Latitude range for the keogram |
-| `--min-ele` | `MIN_ELEVATION` | Minimum satellite elevation cutoff [deg] |
-| `--clim` | `KEO_DTEC_CLIM` | Colour scale ±limit [TECu] |
-| `--gauss-sigma` | `KEO_GAUSS_SIGMA` | Gaussian smoothing sigma [pixels]; 0 = no smoothing |
-| `--lat-step` | `KEO_LAT_STEP` | Latitude grid step [deg] |
-| `--time-step` | `KEO_TIME_STEP` | Time grid step [seconds] |
-| `--exclude-sv` | — | Drop these SV codes before plotting (e.g. `R09`) |
-| `--save-grid` | false | Also save the 2-D grid as parquet to `results/keo_mat/` |
+| `--year YYYY` / `--date YYYY-MM-DD` | — | process a whole year, or one day (one is required) |
+| `--source` | `euref` | `euref`, `local` or `ingv` (see above) |
+| `--local-dir DIR` | — | your RINEX folder, for `--source local` |
+| `--work-dir DIR` | `.` | root folder for all data and outputs |
+| `--stations-file FILE` | all | restrict stations: text file with one ID per line, or a JSON whose keys are IDs |
+| `--start-date` | Jan 1 | resume a `--year` run from this day |
+| `--keo-only` | off | redraw keograms from existing parquets, no downloads |
+| `--exclude-sv SV ...` | — | drop these satellites (e.g. `R09`) from the keogram only; parquets are not changed |
+| `--n-stations N` | 300 | stations to select when building an INGV station list |
 
----
+Environment variables:
 
-### 3. `orchestrator.py` — TEC calibration pipeline (single day or full year)
-
-The sole CLI entry point. Downloads obs from gnssgiving networks and NAV (BRDC)
-from EUREF/BKG, calibrates TEC per station in parallel (`ProcessPoolExecutor`),
-applies Savitzky-Golay detrending, computes IPP positions, and generates keograms.
-
-```
-# Full year:
-python orchestrator.py --year 2025
-
-# Resume from a specific date:
-python orchestrator.py --year 2025 --start-date 2025-06-01
-
-# Single day:
-python orchestrator.py --date 2025-06-21
-
-# Limit to a station subset:
-python orchestrator.py --year 2025 --stations-file network/station_lists/station_networks_2025.json
-
-# Regenerate keograms from existing parquets (no downloads):
-python orchestrator.py --year 2025 --keo-only
-python orchestrator.py --date 2025-06-21 --keo-only
-
-# Regenerate keograms excluding specific SVs (parquets are not modified):
-python orchestrator.py --year 2017 --keo-only --exclude-sv R09
-python orchestrator.py --year 2017 --keo-only --exclude-sv R09 R12
-```
-
-| Argument | Default | Description |
+| Variable | Default | Meaning |
 |---|---|---|
-| `--year YYYY` | — | Process full year (Jan 1 → Dec 31); mutually exclusive with `--date` |
-| `--date YYYY-MM-DD` | — | Process a single day; mutually exclusive with `--year` |
-| `--work-dir` | `.` (project root) | Root folder; `tec_data/` and `results/` are created inside it |
-| `--stations-file` | — | JSON (station→network) or text (one ID per line) to restrict stations |
-| `--start-date` | Jan 1 | Resume year run from this date (`--year` only) |
-| `--keo-only` | false | Regenerate keogram PNG + grid parquet from existing parquets — no FTP downloads |
-| `--exclude-sv` | — | Drop one or more SV codes (e.g. `R09`) from the keogram only; the saved TEC parquets are not modified |
+| `PYKEO_WORKERS` | 8 | parallel worker processes for station calibration |
+| `PYKEO_STATION_TIMEOUT` | 600 | seconds without any station finishing before the day gives up on the stuck ones |
+| `PYKEO_POOL_RETRIES` | 3 | retries after a worker crash, before falling back to one station at a time |
 
-**Processing steps:**
-1. Download obs for D-1, D, D+1 from gnssgiving
-2. Download NAV (BRDC) for D-1, D, D+1 from EUREF and BKG
-3. Parse RINEX obs + nav, precompute satellite coordinates on a common epoch grid; write to `_tmp/` so workers read from disk rather than receiving the large DataFrame through IPC pipes
-4. Per station in parallel: filter GLONASS SVs with no valid channel → extract arcs → compute STEC/VTEC → Savitzky-Golay detrend → compute IPP → write result to `_tmp/`
-5. Main process reads per-station parquets, concatenates, deletes temp files, saves outputs
+**Year runs can be stopped and restarted.** A day counts as done once its keogram PNG
+exists, so a re-run skips finished days and retries failed ones (for example days where
+a server could not be reached).
 
-**Skip logic (year mode):** a day is skipped when the keogram image `keogram_<date>.png` already exists.
+---
 
-**Obs-file lifecycle (rolling 3-day window):**
-- Each day D downloads D-1, D, and D+1 obs on demand
-- After processing day D: delete D-1 obs to free disk space
-- NAV files cover the whole year and are never deleted
+## Outputs
 
-**Cross-year boundary:** Dec 31 of year Y uses the station JSON from year Y for
-Jan 1 of Y+1 (D+1 boundary), and vice versa for Jan 1.
+All paths are relative to `--work-dir`.
 
-**Outputs** (relative to `--work-dir`):
-- `results/tec_data/tec_<date>.parquet`
-- `results/keo_image/keogram_<date>.png`
-- `results/keo_mat/keogram_grid_<date>.parquet`
-- `orchestrator_<year|date>.log`
-- `pipeline_log_<year>.csv` — per-day summary: `date`, `n_stations`, `n_observations`, `n_valid_arcs`, `elapsed_s` (year mode only)
+```
+results/
+├── tec_data/tec_<date>.parquet          calibrated TEC, one row per station × satellite × epoch
+├── keo_image/keogram_<date>.png         keogram
+├── keo_mat/keogram_grid_<date>.parquet  keogram grid (lat × seconds of day), for re-plotting
+└── _keo_test/                           output of keogram_tuner.py
+tec_data/
+├── obs/       obs cache: only the D-1/D/D+1 window is kept, older files are deleted
+├── nav/       NAV files, kept
+├── errors/    errors_<date>.txt: obs files that failed to parse (they are re-downloaded next time)
+└── _tmp/      per-station temporary files during a day
+orchestrator_<year|date>.log
+pipeline_log_<year>.csv                  per day: date, n_stations, n_observations, n_valid_arcs, elapsed_s
+```
 
-**Key pipeline constants:**
+Columns of `tec_<date>.parquet`:
 
-| Constant | Value | Meaning |
+| Column | Meaning |
+|---|---|
+| `epoch` | UTC time (30 s) |
+| `sv` | satellite, e.g. `G01`, `E11`, `R09`, `C30` |
+| `id_arc_valid` | arc ID `<station>_<sv>_<arc start YYYYMMDD>_<n>`, e.g. `aqui_g01_20240620_003` |
+| `lat_ipp`, `lon_ipp` | IPP position [deg] |
+| `azi`, `ele` | satellite azimuth and elevation [deg] |
+| `stec`, `vtec` | calibrated slant and vertical TEC [TECU] |
+| `vtec_detrended` | dTEC [TECU] |
+
+Only arcs that pass the validity checks are kept.
+
+---
+
+## Processing settings
+
+All settings are in [scripts/pykeo_lib/constants.py](scripts/pykeo_lib/constants.py).
+
+| Setting | Value | Meaning |
 |---|---|---|
-| `H_IPP` | 300 km | Ionospheric pierce point height |
-| `MIN_ELEVATION` | 20° | Satellite elevation cutoff |
-| `ARC_THRESHOLD_ABS` | 1 TECU | Arc validity: max absolute VTEC |
-| `ARC_THRESHOLD_STD` | 10 TECU | Arc validity: max VTEC standard deviation |
-| `ARC_THRESHOLD_JUMP` | 1 TECU | Arc validity: max inter-epoch jump |
-| `ARC_MIN_LENGTH` | 190 epochs | Arc validity: minimum arc length |
-| `SG_WINDOW` | 181 epochs | Savitzky-Golay detrending window (~90 min at 30 s) |
-| `SG_ORDER` | 3 | Savitzky-Golay polynomial order |
-| `DEFAULT_LON_SPAN` | (-180, 180) | Longitude range for the keogram plot |
+| `SYSTEMS` | G, E, R, C | constellations used |
+| `H_IPP` | 300 km | ionospheric shell height |
+| `MIN_ELEVATION` | 20° | elevation cutoff |
+| `ARC_MIN_LENGTH` | 190 epochs | minimum arc length |
+| `ARC_MAX_GAP` | 2 min | a longer data gap is a loss of lock and starts a new arc |
+| `ARC_THRESHOLD_ABS`, `ARC_THRESHOLD_STD`, `ARC_THRESHOLD_JUMP` | 1, 5, 1 | cycle-slip detection in pytecgg `extract_arcs`: absolute threshold, standard-deviation multiplier, jump threshold |
+| `VTEC_JUMP_THRESHOLD` | 0.1 TECU | vTEC steps larger than this inside an arc are levelled out |
+| `SG_WINDOW`, `SG_ORDER` | 181 epochs (~90 min), 3 | Savitzky-Golay detrending |
+| `MM_WINDOW` | 20 epochs | moving mean applied to the detrended residual |
+| `KEO_LAT_RANGE` | 37.5–57.5° | keogram latitude range |
+| `KEO_LAT_STEP`, `KEO_TIME_STEP` | 0.05°, 30 s | keogram cell size |
+| `DEFAULT_LON_SPAN` | all | IPP longitudes included in the keogram |
+| `KEO_DTEC_CLIM` | ±0.15 TECU | keogram colour range |
+| `KEO_GAUSS_SIGMA` | 0 | optional Gaussian smoothing of the keogram, in cells |
 
-**Output columns in the parquet:**
-`epoch`, `sv`, `id_arc_valid`, `lat_ipp`, `lon_ipp`, `azi`, `ele`, `stec`, `vtec`, `vtec_detrended`
-
-> `id_arc_valid` is `null` for rejected arcs and a non-null string for valid ones.
-
----
-
-## Typical workflow
-
-```
-# 1. Build station network (once per year / region)
-python build_station_list.py --date 2015-06-21 --n-stations 80
-
-# 2a. Single day
-python orchestrator.py --date 2015-06-21 --stations-file network/station_lists/station_networks_2015.json
-
-# 2b. Full year
-python orchestrator.py --year 2015 --stations-file network/station_lists/station_networks_2015.json
-
-# 3. Re-plot keograms without re-downloading (e.g. after changing colour scale)
-python orchestrator.py --year 2015 --keo-only
-
-# 4. Re-plot excluding a noisy SV (parquets untouched)
-python orchestrator.py --year 2015 --keo-only --exclude-sv R09
-```
+Keogram cells hold the mean dTEC of the IPPs that fall in them; empty cells are filled
+from the nearest non-empty cell.
 
 ---
 
-## Dependencies
+## Helper tools
 
-- `pytecgg` — core GNSS TEC library (installed in `.venv` from the `develop` branch; requires Python ≥ 3.11)
-- `polars` — DataFrame processing
-- `numpy`, `scipy` — numerical operations and Savitzky-Golay filtering
-- `matplotlib`, `cartopy` — plotting and maps
-- `pymap3d` — ECEF ↔ geodetic coordinate conversion (used in `build_station_list.py`)
-- `unlzw3` — LZW decompression for `.Z` files
-- `tqdm` — progress bars
-- `crx2rnx.exe` — Hatanaka RINEX decompressor (must be at project root)
+- [scripts/keogram_tuner.py](scripts/keogram_tuner.py) — redraw a keogram from an
+  existing parquet with different settings, without touching the pipeline outputs:
+  ```
+  python scripts/keogram_tuner.py --date 2024-06-20 --clim 0.3 --gauss-sigma 1.5
+  python scripts/keogram_tuner.py --date 2024-06-20 --lat-step 0.1 --time-step 60 --exclude-sv R09
+  ```
+  Run `--help` for all options. Output goes to `results/_keo_test/`.
+- [scripts/plot_station_map.py](scripts/plot_station_map.py) — map the stations in any
+  folder of RINEX files: `python scripts/plot_station_map.py --obs-dir path/to/my_rinex`.
+- [scripts/plot_station_vtec.py](scripts/plot_station_vtec.py) — interactive HTML plot of
+  elevation, sTEC, vTEC and dTEC per arc for chosen stations on one day:
+  `python scripts/plot_station_vtec.py 2024-06-20`.
+
+These read from `results/` in the project root, i.e. the default `--work-dir .`.
+
+## Tests
+
+Offline checks for file naming, NAV fixes, server failover, station grouping and the
+local source (no network, a few seconds):
+
+```
+pip install pytest
+pytest tests
+```
+
+The [Quick start](#quick-start) command is the end-to-end check.
+
+---
+
+## How to cite
+
+Citation details will be added when the accompanying manuscript is published.
+
+## Licence
+
+MIT, © INGV. See [LICENSE](LICENSE).

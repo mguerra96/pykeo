@@ -11,7 +11,8 @@ import re
 import tempfile
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeout, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, TimeoutError as FuturesTimeout, wait
+from concurrent.futures.process import BrokenProcessPool
 from datetime import date
 from pathlib import Path
 
@@ -43,7 +44,6 @@ from .constants import (
 )
 from .download import (
     _date_to_year_doy,
-    download_obs_gnssgiving,
     ensure_nav,
     merge_nav_dicts,
 )
@@ -55,6 +55,13 @@ logger = logging.getLogger(__name__)
 # (e.g. a native-parser hang), so the run can abandon it and merge partials
 # instead of freezing the whole year. Override via PYKEO_STATION_TIMEOUT.
 STATION_TIMEOUT_S = float(os.environ.get("PYKEO_STATION_TIMEOUT", 600))
+
+# How many times to recreate a broken ProcessPool and retry the stations that
+# didn't finish. A worker crash (native-parser segfault / OOM) breaks the whole
+# pool and fails every pending future; retrying the survivors recovers them. The
+# last attempt runs single-worker so one poison-pill station can't take others
+# down with it. Override via PYKEO_POOL_RETRIES.
+MAX_POOL_RETRIES = int(os.environ.get("PYKEO_POOL_RETRIES", 3))
 
 
 def _level_vtec_jumps(df: pl.DataFrame, threshold: float = VTEC_JUMP_THRESHOLD) -> pl.DataFrame:
@@ -212,9 +219,8 @@ def process_station(
     sat_coords_path: Path,
     epoch_filter: tuple[dt.datetime, dt.datetime],
     epoch_clip: tuple[dt.datetime, dt.datetime],
-    pipeline_kwargs: dict,
     out_dir: Path | None = None,
-) -> Path | None:
+) -> Path | tuple | None:
     """
     Calibrate TEC for one station using three daily obs files (D-1, D, D+1).
 
@@ -244,14 +250,12 @@ def process_station(
         if df_obs.is_empty():
             return None
 
-        rec_name = obs_paths[0].name[:4].lower()
-        systems  = pipeline_kwargs.get("systems", SYSTEMS)
         ctx = GNSSContext(
             receiver_pos=rec_pos,
-            receiver_name=rec_name,
+            receiver_name=obs_paths[0].name[:4].lower(),
             rinex_version=rinex_version,
-            h_ipp=pipeline_kwargs.get("h_ipp", H_IPP),
-            systems=systems,
+            h_ipp=H_IPP,
+            systems=SYSTEMS,
         )
         ctx.glonass_channels.update(glonass_channels)
 
@@ -275,27 +279,21 @@ def process_station(
             .collect()
         )
         df_geom   = df_lc.join(df_coords, on=["sv", "epoch"], how="left")
-        df_ipp    = calculate_ipp(
-            df_geom, ctx=ctx,
-            min_elevation=pipeline_kwargs.get("min_elevation", MIN_ELEVATION),
-        )
+        df_ipp    = calculate_ipp(df_geom, ctx=ctx, min_elevation=MIN_ELEVATION)
 
         df_arcs = extract_arcs(
             df=df_ipp,
             ctx=ctx,
-            threshold_abs=pipeline_kwargs.get("arc_threshold_abs", ARC_THRESHOLD_ABS),
-            threshold_std=pipeline_kwargs.get("arc_threshold_std", ARC_THRESHOLD_STD),
-            threshold_jump=pipeline_kwargs.get("arc_threshold_jump", ARC_THRESHOLD_JUMP),
-            min_arc_length=pipeline_kwargs.get("arc_min_length", ARC_MIN_LENGTH),
-            max_gap=pipeline_kwargs.get("arc_max_gap", ARC_MAX_GAP),
+            threshold_abs=ARC_THRESHOLD_ABS,
+            threshold_std=ARC_THRESHOLD_STD,
+            threshold_jump=ARC_THRESHOLD_JUMP,
+            min_arc_length=ARC_MIN_LENGTH,
+            max_gap=ARC_MAX_GAP,
         )
 
         df_tec = calculate_tec(df_arcs, ctx=ctx)
 
-        df_tec = _level_vtec_jumps(
-            df_tec,
-            threshold=pipeline_kwargs.get("vtec_jump_threshold", VTEC_JUMP_THRESHOLD),
-        )
+        df_tec = _level_vtec_jumps(df_tec)
 
         df_out = _savitzky_golay_detrend(df_tec)
 
@@ -311,11 +309,15 @@ def process_station(
         )
 
         logger.debug(f"  -> {len(df_out):,} rows for {label}")
-        tmp = (out_dir or Path(".")) / f"_tec_{label}.parquet"
+        # Date in the name: an abandoned worker finishing late must not overwrite the next day's file.
+        tmp = (out_dir or Path(".")) / f"_tec_{epoch_clip[0]:%Y-%m-%d}_{label}.parquet"
         df_out.write_parquet(tmp)
         return tmp
 
     except BaseException as e:
+        if "No valid arcs" in str(e):  # normal outcome, raised early by the filter above
+            logger.debug(f"{label}: no valid arcs — skipped")
+            return None
         logger.error(f"Error on {label}: {e}")
         return ("error", obs_paths)
 
@@ -368,28 +370,19 @@ def _group_obs_by_station(obs_files: list[Path]) -> dict[str, list[Path]]:
 
 def run(
     input_date: date,
-    stations: list[str] | None = None,
+    obs_files: list[Path],
     work_dir: Path = Path("."),
-    pipeline_kwargs: dict | None = None,
-    fallback_year: int | None = None,
     n_stations_target: int | None = None,
 ) -> pl.DataFrame:
     """
-    Run the full TEC calibration pipeline for one day.
+    Run the TEC calibration method for one day.
 
-    Downloads obs (D-1, D, D+1) from gnssgiving, downloads NAV files from
-    EUREF/BKG, calibrates all stations in parallel, and returns a merged
-    DataFrame.  Returns an empty DataFrame if no data could be obtained.
-
-    fallback_year is forwarded to download_obs_gnssgiving for cross-year
-    boundary days (D-1 of Jan 1 or D+1 of Dec 31).
+    obs_files: decompressed RINEX obs files for D-1, D and D+1 (see sources.py
+    for how to get them). Downloads NAV files from CDDIS/EUREF, calibrates all
+    stations in parallel, and returns a merged DataFrame clipped to day D.
+    Returns an empty DataFrame if no data could be obtained.
     """
-    if pipeline_kwargs is None:
-        pipeline_kwargs = {}
-
-    obs_dir = work_dir / "tec_data" / "obs"
     nav_dir = work_dir / "tec_data" / "nav"
-    obs_dir.mkdir(parents=True, exist_ok=True)
     nav_dir.mkdir(parents=True, exist_ok=True)
 
     date_prev = input_date - dt.timedelta(days=1)
@@ -405,42 +398,19 @@ def run(
         dt.datetime(input_date.year, input_date.month, input_date.day, 23, 59, 30,  tzinfo=utc),
     )
 
-    logger.info(f"{'='*60}")
-    logger.info(f"Downloading obs for {date_prev} / {input_date} / {date_next}")
-    logger.info(f"{'='*60}")
-
-    # Determine per-day fallback years for cross-year boundary days
-    def _fallback_for(d: date) -> int | None:
-        if d.month == 12 and d.day == 31:
-            return input_date.year  # D+1 of Dec 31 → use primary year JSON
-        if d.month == 1 and d.day == 1:
-            return input_date.year  # D-1 of Jan 1 → use primary year JSON
-        return None
-
-    t_download = time.perf_counter()
-    all_obs: list[Path] = []
-    for d in (date_prev, input_date, date_next):
-        all_obs += download_obs_gnssgiving(
-            d, stations, obs_dir,
-            work_dir=work_dir,
-            fallback_year=_fallback_for(d),
-        )
-    download_elapsed = time.perf_counter() - t_download
-    logger.info(f"Download completed in {download_elapsed:.0f}s")
-
     t_process = time.perf_counter()
     year, doy = _date_to_year_doy(input_date)
     target_ydoy_long  = f"{year}{doy:03d}"           # RINEX 3: STAT...20160010000...
     target_ydoy_short = f"{doy:03d}0.{year % 100:02d}"  # RINEX 2: xxxx0010.16o
     obs_today = [
-        f for f in all_obs
+        f for f in obs_files
         if target_ydoy_long in f.name or target_ydoy_short in f.name
     ]
     if not obs_today:
         logger.error("No obs files found for the target date. Aborting.")
         return pl.DataFrame()
 
-    station_files = _group_obs_by_station(all_obs)
+    station_files = _group_obs_by_station(obs_files)
     n_avail = len(station_files)
     if n_stations_target:
         logger.warning(
@@ -452,12 +422,14 @@ def run(
     logger.debug("Downloading NAV for D-1, D, D+1...")
     nav_dicts = []
     for d in (date_prev, input_date, date_next):
-        y, doy = _date_to_year_doy(d)
-        nav_files = ensure_nav(y, doy, nav_dir)
-        if nav_files:
-            nav_dict = _read_rinex_nav_safe(nav_files[0])
-            if nav_dict is not None:
-                nav_dicts.append(nav_dict)
+        nav_files = ensure_nav(*_date_to_year_doy(d), nav_dir)
+        nav_dict = _read_rinex_nav_safe(nav_files[0]) if nav_files else None
+        if nav_dict is not None:
+            nav_dicts.append(nav_dict)
+        elif d == input_date:
+            # Neighbour-day NAV is out of validity for most of D: abort so the day is retried.
+            logger.error(f"No usable NAV for the target day {d}. Aborting.")
+            return pl.DataFrame()
     if not nav_dicts:
         logger.error("Could not obtain NAV files. Aborting.")
         return pl.DataFrame()
@@ -470,7 +442,7 @@ def run(
         receiver_pos=(0.0, 0.0, 6_371_000.0),
         receiver_name="shared",
         rinex_version="3",
-        systems=pipeline_kwargs.get("systems", SYSTEMS),
+        systems=SYSTEMS,
     )
     ephem_dict       = prepare_ephemeris(nav_dict, ctx=shared_ctx)
     glonass_channels = dict(shared_ctx.glonass_channels)
@@ -509,56 +481,120 @@ def run(
     logger.info(f"Calibrating {len(station_groups)} stations with {n_workers} workers...")
     tmp_paths: list[Path] = []
 
-    pool = ProcessPoolExecutor(max_workers=n_workers)
-    try:
-        futures = {
-            pool.submit(
-                process_station,
-                paths, glonass_channels,
-                sat_coords_path, epoch_filter, epoch_clip,
-                dict(pipeline_kwargs),
-                tmp_dir,
-            ): paths
-            for paths in station_groups
-        }
-        # Per-station hard cap: a single wedged worker (e.g. a native-parser
-        # hang) must not freeze the whole year run. as_completed yields a future
-        # only once it's done, so the timeout bounds the wait for the *next*
-        # completion across all in-flight workers; on trip we abandon whatever is
-        # still pending and proceed with the stations that did finish.
-        with tqdm(total=len(futures), desc="Calibrating", unit="station") as pbar:
-            try:
-                for fut in as_completed(futures, timeout=STATION_TIMEOUT_S):
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        logger.warning(f"Worker error (skipping station): {e}")
-                        pbar.update()
-                        continue
-                    if isinstance(result, tuple) and result[0] == "error":
-                        errors_dir.mkdir(parents=True, exist_ok=True)
-                        with error_log.open("a") as fh:
-                            for p in result[1]:
-                                p.unlink(missing_ok=True)
-                                fh.write(p.name + "\n")
-                                logger.debug(f"[deleted, logged] {p.name}")
-                    elif result is not None:
-                        tmp_paths.append(result)
-                    pbar.update()
-            except FuturesTimeout:
-                n_pending = sum(1 for f in futures if not f.done())
-                logger.error(
-                    f"Calibration stalled: no worker finished within "
-                    f"{STATION_TIMEOUT_S:.0f}s; abandoning {n_pending} pending "
-                    f"station(s) and proceeding with {len(tmp_paths)} done."
+    def _log_error_result(obs_paths: list[Path]) -> None:
+        errors_dir.mkdir(parents=True, exist_ok=True)
+        with error_log.open("a") as fh:
+            for p in obs_paths:
+                p.unlink(missing_ok=True)
+                fh.write(p.name + "\n")
+                logger.debug(f"[deleted, logged] {p.name}")
+
+    def _handle_result(paths: list[Path], result) -> None:
+        """Record one station's outcome: collect its parquet or log an error."""
+        if isinstance(result, tuple) and result[0] == "error":
+            _log_error_result(result[1])
+        elif result is not None:
+            tmp_paths.append(result)
+
+    # Calibrate the station set, recovering from a broken pool. When a worker
+    # crashes (native-parser segfault or OOM), ProcessPoolExecutor marks the
+    # WHOLE pool broken and fails every still-pending future at once — which used
+    # to silently discard ~all remaining stations. We handle this in two phases:
+    #   1. Multi-worker passes: fast path; retry the survivors of a broken pool a
+    #      few times (recovers transient/OOM-under-load crashes that don't repeat).
+    #   2. Single-worker, one-station-at-a-time drain: a deterministic poison-pill
+    #      station crashes only its own task, so every other station still runs.
+    pending_groups = list(station_groups)
+    total = len(pending_groups)
+
+    with tqdm(total=total, desc="Calibrating", unit="station") as pbar:
+        # ---- Phase 1: multi-worker passes -------------------------------------
+        for attempt in range(1, MAX_POOL_RETRIES + 1):
+            if not pending_groups:
+                break
+            if attempt > 1:
+                logger.warning(
+                    f"Pool broke — multi-worker retry {attempt}/{MAX_POOL_RETRIES} "
+                    f"for {len(pending_groups)} unprocessed station(s)."
                 )
-    except Exception as e:
-        logger.error(f"ProcessPoolExecutor failed (likely OOM): {e}")
-    finally:
-        # Don't wait on wedged workers (shutdown(wait=True) would re-block);
-        # cancel_futures drops anything not yet started and we tear down without
-        # joining so a hung worker can't freeze the cleanup.
-        pool.shutdown(wait=False, cancel_futures=True)
+            done_groups: list = []
+            pool = ProcessPoolExecutor(max_workers=n_workers)
+            try:
+                futures = {
+                    pool.submit(
+                        process_station,
+                        paths, glonass_channels,
+                        sat_coords_path, epoch_filter, epoch_clip, tmp_dir,
+                    ): paths
+                    for paths in pending_groups
+                }
+                not_done = set(futures)
+                try:
+                    # Timeout restarts each time any station finishes (as_completed's
+                    # timeout would cap the whole day instead).
+                    while not_done:
+                        done, not_done = wait(
+                            not_done, timeout=STATION_TIMEOUT_S, return_when=FIRST_COMPLETED
+                        )
+                        if not done:
+                            raise FuturesTimeout
+                        for fut in done:
+                            paths = futures[fut]
+                            try:
+                                result = fut.result()
+                            except BrokenProcessPool:
+                                raise  # abort pass; survivors stay pending for retry
+                            except Exception as e:
+                                logger.warning(f"Worker error (skipping station): {e}")
+                                done_groups.append(paths)
+                                pbar.update()
+                                continue
+                            done_groups.append(paths)
+                            _handle_result(paths, result)
+                            pbar.update()
+                except FuturesTimeout:
+                    n_pending = sum(1 for f in futures if not f.done())
+                    logger.error(
+                        f"Calibration stalled: no worker finished within "
+                        f"{STATION_TIMEOUT_S:.0f}s; abandoning {n_pending} pending "
+                        f"station(s) and proceeding with {len(tmp_paths)} done."
+                    )
+                    done_groups = list(pending_groups)  # a stall won't recover
+            except Exception as e:
+                logger.error(f"ProcessPoolExecutor broke (likely worker crash/OOM): {e}")
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            done_ids = {id(g) for g in done_groups}
+            pending_groups = [g for g in pending_groups if id(g) not in done_ids]
+
+        # ---- Phase 2: single-worker, one station at a time --------------------
+        # Each submit runs in its own fresh pool, so a crash isolates exactly that
+        # station and the rest still get processed.
+        if pending_groups:
+            logger.warning(
+                f"Draining {len(pending_groups)} remaining station(s) one at a "
+                f"time to isolate the crash."
+            )
+        for paths in pending_groups:
+            pool = ProcessPoolExecutor(max_workers=1)
+            try:
+                fut = pool.submit(
+                    process_station,
+                    paths, glonass_channels,
+                    sat_coords_path, epoch_filter, epoch_clip, tmp_dir,
+                )
+                _handle_result(paths, fut.result(timeout=STATION_TIMEOUT_S))
+            except (BrokenProcessPool, FuturesTimeout):
+                logger.error(
+                    f"Station {paths[0].name[:4].upper()} crashed/stalled its "
+                    f"worker — skipping it."
+                )
+            except Exception as e:
+                logger.warning(f"Worker error (skipping station): {e}")
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+                pbar.update()
 
     if not tmp_paths:
         logger.error("No data produced after calibration (pool failure or stall).")

@@ -104,3 +104,44 @@ def ensure_station_networks(
 def station_ids_from_networks(mapping: dict[str, str]) -> list[str]:
     """Return sorted station IDs from a station→network mapping."""
     return sorted(mapping.keys())
+
+
+def read_rinex_coords(f: Path) -> tuple[float, float] | None:
+    """Return (lat, lon) from a RINEX obs header's APPROX POSITION XYZ, or None."""
+    import pymap3d
+
+    try:
+        with f.open("r", encoding="ascii", errors="ignore") as fh:
+            for line in fh:
+                if "END OF HEADER" in line:
+                    break
+                if "APPROX POSITION XYZ" in line:
+                    x, y, z = float(line[0:14]), float(line[14:28]), float(line[28:42])
+                    if x == 0.0 and y == 0.0 and z == 0.0:
+                        return None
+                    lat, lon, _ = pymap3d.ecef2geodetic(x, y, z)
+                    return float(lat), float(lon)
+    except Exception:
+        pass
+    return None
+
+
+def farthest_point_sample(
+    coords: dict[str, tuple[float, float]],
+    n: int,
+) -> dict[str, tuple[float, float]]:
+    """Pick n stations that spread out best: each next pick is the one farthest from all picked so far."""
+    import numpy as np
+
+    if n <= 0 or n >= len(coords):
+        return coords
+    names = list(coords.keys())
+    pts   = np.array([coords[s] for s in names])
+    selected  = [0]
+    min_dists = np.full(len(pts), np.inf)
+    for _ in range(n - 1):
+        last      = pts[selected[-1]]
+        dists     = np.sqrt(((pts - last) ** 2).sum(axis=1))
+        min_dists = np.minimum(min_dists, dists)
+        selected.append(int(np.argmax(min_dists)))
+    return {names[i]: coords[names[i]] for i in selected}

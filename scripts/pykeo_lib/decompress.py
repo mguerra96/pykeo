@@ -18,10 +18,24 @@ def _is_hatanaka_rinex3(p: Path) -> bool:
     return p.suffix.lower() == ".crx"
 
 
+def can_decompress(fname: str) -> bool:
+    """False for RINEX 2 Hatanaka files when crx2rnx is missing: pytecgg cannot read those."""
+    return CRX2RNX.exists() or not _is_hatanaka_rinex2(Path(_uncompressed_name(fname)))
+
+
+def _uncompressed_name(fname: str) -> str:
+    for ext in (".Z", ".gz"):
+        if fname.endswith(ext):
+            fname = fname[: -len(ext)]
+    return fname
+
+
 def _run_crx2rnx(p: Path) -> Path | None:
     if not CRX2RNX.exists():
-        logger.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
-        return p
+        if _is_hatanaka_rinex3(p):
+            return p  # pytecgg reads RINEX 3 Hatanaka directly (same data as crx2rnx output)
+        logger.warning(f"crx2rnx not found — cannot read RINEX 2 Hatanaka file {p.name}")
+        return None
     try:
         # Use DEVNULL rather than capture_output: capture_output opens OS pipes
         # whose handles can be inherited by ProcessPoolExecutor worker spawns, so
@@ -117,13 +131,9 @@ def decompress(raw_path: Path) -> Path | None:
 
 def expected_final_path(fname: str, local_dir: Path) -> Path:
     """Predict the final decompressed path for a filename before downloading."""
-    stem = fname
-    for ext in (".Z", ".gz"):
-        if stem.endswith(ext):
-            stem = stem[: -len(ext)]
-    stem_path = local_dir / stem
+    stem_path = local_dir / _uncompressed_name(fname)
     if _is_hatanaka_rinex2(stem_path):
         return stem_path.with_suffix(stem_path.suffix[:-1] + "O")
-    if _is_hatanaka_rinex3(stem_path):
+    if _is_hatanaka_rinex3(stem_path) and CRX2RNX.exists():
         return stem_path.with_suffix(".rnx")
     return stem_path

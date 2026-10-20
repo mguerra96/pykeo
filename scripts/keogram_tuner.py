@@ -8,16 +8,16 @@ experiment with gridding and display parameters without touching the pipeline.
 Usage
 -----
 # by date (resolves parquet from results/tec_data/ automatically)
-python test_keogram_plot.py --date 2015-06-21
+python keogram_tuner.py --date 2015-06-21
 
 # explicit parquet path
-python test_keogram_plot.py tec_2015-06-21.parquet
+python keogram_tuner.py tec_2015-06-21.parquet
 
 # override parameters
-python test_keogram_plot.py --date 2015-06-21 --clim 0.3 --gauss-sigma 1.5
-python test_keogram_plot.py --date 2015-06-21 --lon-span 10 25 --lat-range 37.5 57.5
-python test_keogram_plot.py --date 2015-06-21 --lat-step 0.1 --time-step 60
-python test_keogram_plot.py --date 2015-06-21 --exclude-sv R09 R12
+python keogram_tuner.py --date 2015-06-21 --clim 0.3 --gauss-sigma 1.5
+python keogram_tuner.py --date 2015-06-21 --lon-span 10 25 --lat-range 37.5 57.5
+python keogram_tuner.py --date 2015-06-21 --lat-step 0.1 --time-step 60
+python keogram_tuner.py --date 2015-06-21 --exclude-sv R09 R12
 """
 
 import argparse
@@ -44,7 +44,7 @@ from pykeo_lib.keogram import plot_keogram
 _PROJECT_ROOT = Path(__file__).parent.parent
 _TEC_DIR      = _PROJECT_ROOT / "results" / "tec_data"
 _KEO_DIR      = _PROJECT_ROOT / "results" / "_keo_test"
-_MAT_DIR      = _PROJECT_ROOT / "results" / "keo_mat"
+_MAT_DIR      = _KEO_DIR  # never results/keo_mat: test grids must not overwrite the pipeline's
 
 
 if __name__ == "__main__":
