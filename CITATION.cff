@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "pykeo: GNSS TEC calibration and keograms"
+abstract: >-
+  pykeo turns daily RINEX observation files from a network of GNSS receivers
+  into calibrated vertical Total Electron Content (vTEC) and detrended TEC
+  (dTEC) at the ionospheric pierce points, and plots the dTEC as
+  latitude–time keograms.
+authors:
+  - family-names: Guerra
+    given-names: Marco
+    affiliation: "Istituto Nazionale di Geofisica e Vulcanologia (INGV)"
+    orcid: "https://orcid.org/0000-0001-9993-2366"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23495571
+    description: "All versions (resolves to the latest release)"
+doi: 10.5281/zenodo.23495571
+repository-code: "https://github.com/mguerra96/pykeo"
+license: MIT
+version: 1.0.1
+date-released: "2026-10-20"
+keywords:
+  - GNSS
+  - ionosphere
+  - total electron content
+  - TEC
+  - keogram
+  - RINEX
