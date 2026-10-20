@@ -244,7 +244,25 @@ The [Quick start](#quick-start) command is the end-to-end check.
 
 ## How to cite
 
-Citation details will be added when the accompanying manuscript is published.
+pykeo is archived on Zenodo: [doi:10.5281/zenodo.23495571](https://doi.org/10.5281/zenodo.23495571).
+This DOI always resolves to the latest version; the Zenodo page also lists a DOI for
+each release, to cite the exact version you used.
+
+```
+Guerra, M. pykeo: GNSS TEC calibration and keograms. Zenodo. https://doi.org/10.5281/zenodo.23495571
+```
+
+```bibtex
+@software{guerra_pykeo,
+  author    = {Guerra, Marco},
+  title     = {pykeo: GNSS TEC calibration and keograms},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.23495571},
+  url       = {https://doi.org/10.5281/zenodo.23495571}
+}
+```
+
+The accompanying manuscript will be added here once published.
 
 ## Licence
 
