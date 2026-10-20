@@ -1,10 +1,11 @@
 """
 Plot a map of all stations found in a directory of decompressed RINEX obs files.
+Works with any data source (e.g. the folder you pass to --source local).
 
 Usage
 -----
-python plot_station_map.py --obs-dir gnssgiving_obs
-python plot_station_map.py --obs-dir gnssgiving_obs --out map.png --workers 16
+python plot_station_map.py --obs-dir path/to/my_rinex
+python plot_station_map.py --obs-dir path/to/my_rinex --out map.png --workers 16
 """
 
 import argparse
@@ -15,9 +16,9 @@ from pathlib import Path
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
-import numpy as np
-import pymap3d
 from tqdm import tqdm
+
+from pykeo_lib.stations import farthest_point_sample, read_rinex_coords
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,27 +34,6 @@ MARKER_COLOR     = "crimson"
 # Coordinate extraction
 # ---------------------------------------------------------------------------
 
-def _read_coords(f: Path) -> tuple[float, float] | None:
-    """Parse APPROX POSITION XYZ from RINEX header and return (lat, lon), or None."""
-    try:
-        with f.open("r", encoding="ascii", errors="ignore") as fh:
-            for line in fh:
-                if "END OF HEADER" in line:
-                    break
-                if "APPROX POSITION XYZ" in line:
-                    x, y, z = float(line[0:14]), float(line[14:28]), float(line[28:42])
-                    if x == 0.0 and y == 0.0 and z == 0.0:
-                        return None
-                    lat, lon, _ = pymap3d.ecef2geodetic(x, y, z)
-                    lat, lon = float(lat), float(lon)
-                    if not (35.0 <= lat <= 60.0 and 0.0 <= lon <= 20.0):
-                        return None
-                    return lat, lon
-    except Exception:
-        pass
-    return None
-
-
 def read_all_coords(obs_dir: Path, workers: int) -> dict[str, tuple[float, float]]:
     files = [
         f for f in obs_dir.iterdir()
@@ -65,7 +45,7 @@ def read_all_coords(obs_dir: Path, workers: int) -> dict[str, tuple[float, float
     seen: set[str] = set()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_read_coords, f): f for f in files}
+        futs = {pool.submit(read_rinex_coords, f): f for f in files}
         with tqdm(total=len(futs), desc="Reading headers", unit="file", dynamic_ncols=True, file=sys.stderr) as pbar:
             for fut in as_completed(futs):
                 f = futs[fut]
@@ -79,28 +59,6 @@ def read_all_coords(obs_dir: Path, workers: int) -> dict[str, tuple[float, float
                     coords[sta] = result
 
     return coords
-
-
-# ---------------------------------------------------------------------------
-# Spatial sub-sampling
-# ---------------------------------------------------------------------------
-
-def farthest_point_sample(
-    coords: dict[str, tuple[float, float]],
-    n: int,
-) -> dict[str, tuple[float, float]]:
-    if n <= 0 or n >= len(coords):
-        return coords
-    names = list(coords.keys())
-    pts   = np.array([coords[s] for s in names])
-    selected  = [0]
-    min_dists = np.full(len(pts), np.inf)
-    for _ in range(n - 1):
-        last      = pts[selected[-1]]
-        dists     = np.sqrt(((pts - last) ** 2).sum(axis=1))
-        min_dists = np.minimum(min_dists, dists)
-        selected.append(int(np.argmax(min_dists)))
-    return {names[i]: coords[names[i]] for i in selected}
 
 
 # ---------------------------------------------------------------------------

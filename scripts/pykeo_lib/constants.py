@@ -1,11 +1,11 @@
 import datetime as dt
+import shutil
 from pathlib import Path
 
 # EUREF EPN FTP
 FTP_HOST             = "www.epncb.oma.be"
 FTP_TIMEOUT_LIST     = 120
-FTP_TIMEOUT_DOWNLOAD = 120
-FTP_TIMEOUT_TRANSFER = 5     # wall-clock cap per file (retrbinary can stall indefinitely)
+FTP_TIMEOUT_DOWNLOAD = 120   # per socket operation: a stalled transfer fails after this
 
 # gnssgiving FTP — primary + fallback hosts (same directory layout)
 GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")
@@ -59,5 +59,7 @@ COLS_TO_KEEP = [
     "stec", "vtec", "vtec_detrended",
 ]
 
-# Hatanaka decompressor — sits at the project root (parent of scripts/)
-CRX2RNX = Path(__file__).parent.parent.parent / "crx2rnx.exe"
+# Hatanaka decompressor (RNXCMP crx2rnx): on PATH, else the copy at the project root.
+# Optional: pytecgg reads RINEX 3 .crx itself; only RINEX 2 Hatanaka (.yyD) files need it.
+_crx2rnx_on_path = shutil.which("crx2rnx") or shutil.which("CRX2RNX")
+CRX2RNX = Path(_crx2rnx_on_path) if _crx2rnx_on_path else Path(__file__).parent.parent.parent / "crx2rnx.exe"

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .venv/
+.pytest_cache/
 venv/
 
 # Pipeline data — large, downloaded/generated at runtime

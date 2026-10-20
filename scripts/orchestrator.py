@@ -3,11 +3,15 @@ TEC pipeline orchestrator — yearly or single-day processing.
 
 Usage
 -----
-# Process the full year 2025:
+# Process the full year 2025 (obs from the public EUREF archive, the default):
 python orchestrator.py --year 2025
 
 # Process a single day:
 python orchestrator.py --date 2025-06-15
+
+# Use your own RINEX files, or INGV networks (INGV network only):
+python orchestrator.py --date 2025-06-15 --source local --local-dir path/to/my_rinex
+python orchestrator.py --date 2025-06-15 --source ingv
 
 # Resume a year run from a specific date:
 python orchestrator.py --year 2025 --start-date 2025-03-01
@@ -19,13 +23,13 @@ python orchestrator.py --year 2025 --stations-file network/station_lists/station
 python orchestrator.py --year 2025 --keo-only
 python orchestrator.py --date 2025-06-15 --keo-only
 
-Outputs
+Outputs (relative to --work-dir)
 -------
-  D:\pykeo\results\tec_data\tec_<date>.parquet
-  D:\pykeo\results\keo_mat\keogram_grid_<date>.parquet
-  results/keo_image/keogram_<date>.png            (relative to --work-dir)
-  orchestrator_<year|date>.log                    (relative to --work-dir)
-  pipeline_log_<year|date>.csv                    (--year mode only)
+  results/tec_data/tec_<date>.parquet
+  results/keo_mat/keogram_grid_<date>.parquet
+  results/keo_image/keogram_<date>.png
+  orchestrator_<year|date>.log
+  pipeline_log_<year>.csv                         (--year mode only)
 """
 
 import argparse
@@ -36,13 +40,30 @@ import logging
 import sys
 import time
 from datetime import date
+from functools import partial
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from pykeo_lib.constants import CRX2RNX
 from pykeo_lib.download import _date_to_year_doy
 from pykeo_lib.pipeline import run
+from pykeo_lib.sources import obs_euref, obs_ingv, obs_local
 from pykeo_lib.stations import ensure_station_networks, station_ids_from_networks
+
+
+def _obs_source(source: str, work_dir: Path, local_dir: Path | None):
+    """Return the get_obs(day, stations, obs_dir) function for --source (see pykeo_lib/sources.py)."""
+    if not CRX2RNX.exists():
+        logging.getLogger("orchestrator").warning(
+            "crx2rnx not found (PATH or project root): RINEX 2 Hatanaka (.yyD) files will be "
+            "skipped. RINEX 3 works without it. Install RNXCMP to read RINEX 2 Hatanaka."
+        )
+    if source == "local":
+        return partial(obs_local, src_dir=local_dir)
+    if source == "ingv":
+        return partial(obs_ingv, work_dir=work_dir)
+    return obs_euref
 
 # NOTE: plot_keogram is imported lazily inside process_day() to avoid loading
 # scipy in every ProcessPoolExecutor worker process spawned by pipeline.run().
@@ -143,8 +164,21 @@ def _append_csv_row(csv_path: Path, row: dict) -> None:
 # Single-day processing
 # ---------------------------------------------------------------------------
 
-def _all_outputs_exist(date_str: str, tec_dir: Path, keo_dir: Path, mat_dir: Path) -> bool:
-    """Return True if the keogram PNG exists for the given date string."""
+def _output_dirs(work_dir: Path) -> tuple[Path, Path, Path, Path]:
+    """Create and return (obs, tec parquet, keogram PNG, keogram grid) folders under work_dir."""
+    dirs = (
+        work_dir / "tec_data" / "obs",
+        work_dir / "results" / "tec_data",
+        work_dir / "results" / "keo_image",
+        work_dir / "results" / "keo_mat",
+    )
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def _keogram_exists(keo_dir: Path, date_str: str) -> bool:
+    """A day counts as done once its keogram PNG exists (it is written last)."""
     return (keo_dir / f"keogram_{date_str}.png").exists()
 
 
@@ -160,6 +194,7 @@ def process_day(
     keo_only: bool = False,
     n_stations_target: int | None = None,
     exclude_sv: list[str] | None = None,
+    get_obs=obs_euref,
 ) -> bool:
     """
     Run the full pipeline (or keogram-only) for one calendar day.
@@ -193,9 +228,13 @@ def process_day(
 
     t_start = time.perf_counter()
     try:
+        obs_dir = work_dir / "tec_data" / "obs"
+        window  = [target_date + dt.timedelta(days=k) for k in (-1, 0, 1)]
+        obs_files = [p for d in window for p in get_obs(d, stations, obs_dir)]
+        logger.info(f"  Obs ready in {time.perf_counter() - t_start:.0f}s: {len(obs_files)} file(s)")
         df = run(
             input_date=target_date,
-            stations=stations,
+            obs_files=obs_files,
             work_dir=work_dir,
             n_stations_target=n_stations_target,
         )
@@ -247,23 +286,21 @@ def orchestrate_year(
     keo_only: bool = False,
     n_stations: int = 300,
     exclude_sv: list[str] | None = None,
+    source: str = "euref",
+    local_dir: Path | None = None,
 ) -> None:
     """Process all days in a year sequentially, with rolling obs cleanup."""
     log_path = work_dir / f"orchestrator_{year}.log"
     csv_path = work_dir / f"pipeline_log_{year}.csv"
     logger   = _setup_logging(log_path)
 
-    obs_dir = work_dir / "tec_data" / "obs"
-    tec_dir = Path(r"D:\pykeo\results\tec_data")
-    keo_dir = work_dir / "results" / "keo_image"
-    mat_dir = Path(r"D:\pykeo\results\keo_mat")
-    for d in (obs_dir, tec_dir, keo_dir, mat_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    obs_dir, tec_dir, keo_dir, mat_dir = _output_dirs(work_dir)
 
-    # Auto-build station JSON if needed (unless keo-only, which needs no downloads)
-    if not keo_only:
+    # INGV source only: auto-build the station→network JSON if needed
+    if not keo_only and source == "ingv":
         mapping  = ensure_station_networks(year, work_dir, n_stations=n_stations)
         stations = station_ids_from_networks(mapping) if stations is None else stations
+    get_obs = _obs_source(source, work_dir, local_dir)
 
     first_day = start_date or date(year, 1, 1)
     last_day  = date(year, 12, 31)
@@ -284,8 +321,8 @@ def orchestrate_year(
         date_str  = target_date.isoformat()
         date_prev = target_date - dt.timedelta(days=1)
 
-        if not keo_only and _all_outputs_exist(date_str, tec_dir, keo_dir, mat_dir):
-            logger.debug(f"[SKIP] {date_str} — all outputs exist.")
+        if not keo_only and _keogram_exists(keo_dir, date_str):
+            logger.debug(f"[SKIP] {date_str} — keogram exists.")
             _delete_obs_day(obs_dir, target_date - dt.timedelta(days=2), logger)
             success_count += 1
             continue
@@ -300,8 +337,9 @@ def orchestrate_year(
             logger=logger,
             csv_path=csv_path,
             keo_only=keo_only,
-            n_stations_target=n_stations,
+            n_stations_target=n_stations if source == "ingv" else None,
             exclude_sv=exclude_sv,
+            get_obs=get_obs,
         )
 
         if ok:
@@ -327,22 +365,20 @@ def orchestrate_date(
     keo_only: bool = False,
     n_stations: int = 300,
     exclude_sv: list[str] | None = None,
+    source: str = "euref",
+    local_dir: Path | None = None,
 ) -> None:
     """Process a single calendar day and clean up D-1/D+1 obs afterwards."""
     date_str = target_date.isoformat()
     log_path = work_dir / f"orchestrator_{date_str}.log"
     logger   = _setup_logging(log_path)
 
-    obs_dir = work_dir / "tec_data" / "obs"
-    tec_dir = Path(r"D:\pykeo\results\tec_data")
-    keo_dir = work_dir / "results" / "keo_image"
-    mat_dir = Path(r"D:\pykeo\results\keo_mat")
-    for d in (obs_dir, tec_dir, keo_dir, mat_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    obs_dir, tec_dir, keo_dir, mat_dir = _output_dirs(work_dir)
 
     if not keo_only:
-        mapping  = ensure_station_networks(target_date.year, work_dir, n_stations=n_stations)
-        stations = station_ids_from_networks(mapping) if stations is None else stations
+        if source == "ingv":
+            mapping  = ensure_station_networks(target_date.year, work_dir, n_stations=n_stations)
+            stations = station_ids_from_networks(mapping) if stations is None else stations
         _cleanup_obs_dir(obs_dir, target_date, logger)
 
     logger.info(f"Processing single date: {date_str}")
@@ -357,8 +393,9 @@ def orchestrate_date(
         logger=logger,
         csv_path=None,
         keo_only=keo_only,
-        n_stations_target=n_stations,
+        n_stations_target=n_stations if source == "ingv" else None,
         exclude_sv=exclude_sv,
+        get_obs=_obs_source(source, work_dir, local_dir),
     )
 
     if not keo_only:
@@ -387,6 +424,12 @@ if __name__ == "__main__":
     mode_group.add_argument("--date", metavar="YYYY-MM-DD",
                             help="Process a single day (D-1/D/D+1 window)")
 
+    parser.add_argument("--source",        default="euref", choices=["euref", "local", "ingv"],
+                        help="Where obs files come from: euref = public EUREF EPN archive, "
+                             "local = your own files in --local-dir, "
+                             "ingv = INGV gnssgiving (INGV network only)")
+    parser.add_argument("--local-dir",     default=None, metavar="DIR",
+                        help="Folder with your own RINEX obs files (--source local)")
     parser.add_argument("--work-dir",      default=".", metavar="DIR",
                         help="Root data folder")
     parser.add_argument("--start-date",    default=None, metavar="YYYY-MM-DD",
@@ -404,6 +447,9 @@ if __name__ == "__main__":
                              "the saved TEC parquet is not modified")
 
     args = parser.parse_args()
+    if args.source == "local" and not args.keo_only and not args.local_dir:
+        parser.error("--source local needs --local-dir")
+    local_dir = Path(args.local_dir) if args.local_dir else None
 
     work_dir = Path(args.work_dir)
 
@@ -412,9 +458,10 @@ if __name__ == "__main__":
     if args.stations_file:
         p = Path(args.stations_file)
         if p.suffix.lower() == ".json":
-            stations = list(json.loads(p.read_text(encoding="utf-8")).keys())
+            stations = list(json.loads(p.read_text(encoding="utf-8-sig")).keys())
         else:
-            stations = [s.strip() for s in p.read_text(encoding="utf-8").splitlines() if s.strip()]
+            # utf-8-sig: Notepad and PowerShell may add a BOM that would corrupt the first ID
+            stations = [s.strip() for s in p.read_text(encoding="utf-8-sig").splitlines() if s.strip()]
 
     if args.year:
         start_date = (
@@ -429,6 +476,8 @@ if __name__ == "__main__":
             keo_only=args.keo_only,
             n_stations=args.n_stations,
             exclude_sv=args.exclude_sv,
+            source=args.source,
+            local_dir=local_dir,
         )
     else:
         if args.start_date:
@@ -441,4 +490,6 @@ if __name__ == "__main__":
             keo_only=args.keo_only,
             n_stations=args.n_stations,
             exclude_sv=args.exclude_sv,
+            source=args.source,
+            local_dir=local_dir,
         )

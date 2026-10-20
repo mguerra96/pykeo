@@ -36,14 +36,9 @@ Note: crx2rnx.exe must be present in the project root directory.
 """
 
 import argparse
-import ftplib
-import gzip
-import io
 import json
 import logging
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 
@@ -51,8 +46,11 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 import numpy as np
-import pymap3d
 from tqdm import tqdm
+
+from pykeo_lib.constants import GNSSGIVING_HOSTS
+from pykeo_lib.download import _download_one, _list_ftp_dir_failover
+from pykeo_lib.stations import farthest_point_sample, read_rinex_coords
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +71,7 @@ log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_DIR = _PROJECT_ROOT / "network" / "station_rnx"
-CRX2RNX    = Path(__file__).parent.parent / "crx2rnx.exe"
 
-GNSSGIVING_HOSTS = ("mga.int.ingv.it", "gnssgiving.int.ingv.it")
 GNSSGIVING_BASE  = "/CONTINUOUS/30s"
 
 # Bounding box for station filtering
@@ -85,141 +81,19 @@ LON_MIN, LON_MAX =  0.0, 20.0
 # Default spatial sub-sample
 DEFAULT_N_STATIONS = 300
 
-FTP_TIMEOUT_LIST     = 120
-FTP_TIMEOUT_DOWNLOAD = 5
-
 MAP_PANEL_HEIGHT = 9
 MAP_DPI          = 150
 DEFAULT_WORKERS  = 8
 
 
 # ---------------------------------------------------------------------------
-# Decompression helpers
-# ---------------------------------------------------------------------------
-
-def _unlzw_safe(data: bytes) -> bytes | None:
-    """Run unlzw3 in a subprocess so a C-level crash doesn't kill the main process."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; from unlzw3 import unlzw; sys.stdout.buffer.write(unlzw(sys.stdin.buffer.read()))"],
-            input=data, capture_output=True, timeout=60,
-        )
-        if result.returncode == 0 and result.stdout:
-            return result.stdout
-        return None
-    except Exception:
-        return None
-
-
-def _is_hatanaka_rnx2(p: Path) -> bool:
-    return len(p.suffix) == 4 and p.suffix.upper().endswith("D")
-
-
-def _is_hatanaka_rnx3(p: Path) -> bool:
-    return p.suffix.lower() == ".crx"
-
-
-def _run_crx2rnx(p: Path) -> Path | None:
-    if not CRX2RNX.exists():
-        log.warning("crx2rnx.exe not found — skipping Hatanaka decompression")
-        return p
-    try:
-        subprocess.run([str(CRX2RNX), "-f", "-d", str(p)], capture_output=True, check=False, timeout=5)
-        out = (
-            p.with_suffix(p.suffix[:-1] + "O")
-            if _is_hatanaka_rnx2(p)
-            else p.with_suffix(".rnx")
-        )
-        if out.exists():
-            p.unlink(missing_ok=True)
-            return out
-        log.warning(f"crx2rnx produced no output for {p.name}")
-    except subprocess.TimeoutExpired:
-        log.warning(f"crx2rnx timed out on {p.name} — skipping")
-        p.unlink(missing_ok=True)
-    except Exception as e:
-        log.warning(f"crx2rnx error on {p.name}: {e}")
-    return None
-
-
-def decompress_and_dehatanaka(local_path: Path) -> Path | None:
-    p = local_path
-
-    if p.suffix == ".Z":
-        out = p.with_suffix("")
-        raw = p.read_bytes()
-        if raw[:2] == b"\x1f\x8b":
-            try:
-                out.write_bytes(gzip.open(io.BytesIO(raw)).read())
-                p.unlink(missing_ok=True)
-                p = out
-            except Exception as e:
-                log.warning(f"gunzip(.Z) failed for {local_path.name}: {e}")
-                return None
-        else:
-            decompressed = _unlzw_safe(raw)
-            if decompressed is None:
-                log.warning(f"unlzw failed for {local_path.name}")
-                return None
-            out.write_bytes(decompressed)
-            p.unlink(missing_ok=True)
-            p = out
-
-    if p.suffix == ".gz":
-        out = p.with_suffix("")
-        raw = p.read_bytes()
-        try:
-            if raw[:2] == b"\x1f\x9d":
-                decompressed = _unlzw_safe(raw)
-                if decompressed is None:
-                    log.warning(f"unlzw(.gz) failed for {local_path.name}")
-                    return None
-                out.write_bytes(decompressed)
-            else:
-                out.write_bytes(gzip.open(io.BytesIO(raw)).read())
-            p.unlink(missing_ok=True)
-            p = out
-        except Exception as e:
-            log.warning(f"decompress(.gz) failed for {local_path.name}: {e}")
-            return None
-
-    if _is_hatanaka_rnx2(p) or _is_hatanaka_rnx3(p):
-        result = _run_crx2rnx(p)
-        if result is None:
-            return None
-        p = result
-
-    return p
-
-
-# ---------------------------------------------------------------------------
 # FTP helpers
 # ---------------------------------------------------------------------------
 
-def _list_ftp_dir(host: str, remote_dir: str) -> list[str]:
-    try:
-        with ftplib.FTP(host, timeout=FTP_TIMEOUT_LIST) as ftp:
-            ftp.login()
-            ftp.cwd(remote_dir)
-            return [Path(f).name for f in ftp.nlst()]
-    except Exception as e:
-        log.debug(f"FTP listing failed {host}{remote_dir}: {e}")
-        return []
-
-
-def _list_ftp_dir_failover(remote_dir: str) -> tuple[list[str], str | None]:
-    """Try GNSSGIVING_HOSTS in order; return (files, host_that_worked) or ([], None)."""
-    for host in GNSSGIVING_HOSTS:
-        files = _list_ftp_dir(host, remote_dir)
-        if files:
-            return files, host
-        log.warning(f"[failover] {host}{remote_dir} empty/unreachable — trying next host")
-    return [], None
-
-
 def _list_networks() -> list[str]:
-    files, _ = _list_ftp_dir_failover(GNSSGIVING_BASE)
+    files, _ = _list_ftp_dir_failover(GNSSGIVING_HOSTS, GNSSGIVING_BASE)
+    if files is None:
+        raise ConnectionError(f"gnssgiving unreachable ({GNSSGIVING_HOSTS}) — INGV network only")
     return files
 
 
@@ -236,55 +110,16 @@ def _is_obs_file(fname: str) -> bool:
     return False
 
 
-def _expected_final_path(fname: str, local_dir: Path) -> Path:
-    stem = fname
-    for ext in (".Z", ".gz"):
-        if stem.endswith(ext):
-            stem = stem[:-len(ext)]
-    stem_path = local_dir / stem
-    if _is_hatanaka_rnx2(stem_path):
-        return stem_path.with_suffix(stem_path.suffix[:-1] + "O")
-    if _is_hatanaka_rnx3(stem_path):
-        return stem_path.with_suffix(".rnx")
-    return stem_path
-
-
-def _download_one(fname: str, remote_dir: str, local_dir: Path, host: str) -> Path | None:
-    final_path = _expected_final_path(fname, local_dir)
-    if final_path.exists():
-        return final_path
-    raw_path = local_dir / fname
-
-    def _do_transfer() -> None:
-        with ftplib.FTP(host, timeout=FTP_TIMEOUT_DOWNLOAD) as ftp:
-            ftp.login()
-            ftp.cwd(remote_dir)
-            ftp.sock.settimeout(FTP_TIMEOUT_DOWNLOAD)
-            with open(raw_path, "wb") as f:
-                ftp.retrbinary(f"RETR {fname}", f.write)
-
-    try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_do_transfer)
-            fut.result(timeout=FTP_TIMEOUT_DOWNLOAD)
-    except FutTimeout:
-        log.warning(f"[timeout] {fname} — transfer stalled after {FTP_TIMEOUT_DOWNLOAD}s")
-        raw_path.unlink(missing_ok=True)
-        return None
-    except Exception as e:
-        log.warning(f"[fail] {fname}: {e}")
-        raw_path.unlink(missing_ok=True)
-        return None
-    return decompress_and_dehatanaka(raw_path)
-
-
 # ---------------------------------------------------------------------------
 # Per-network download
 # ---------------------------------------------------------------------------
 
 def download_network(network: str, remote_dir: str, local_dir: Path, workers: int) -> list[Path]:
     local_dir.mkdir(parents=True, exist_ok=True)
-    files, host = _list_ftp_dir_failover(remote_dir)
+    files, host = _list_ftp_dir_failover(GNSSGIVING_HOSTS, remote_dir)
+    if files is None:
+        # Fail loudly: a silently empty network would leave its stations out of the whole year.
+        raise ConnectionError(f"{network}: no host reachable for {remote_dir}")
     obs_files = [f for f in files if _is_obs_file(f)]
     if not obs_files:
         return []
@@ -305,23 +140,6 @@ def download_network(network: str, remote_dir: str, local_dir: Path, workers: in
 # Coordinate extraction (header-only, no pytecgg)
 # ---------------------------------------------------------------------------
 
-def _read_coords(f: Path) -> tuple[float, float] | None:
-    try:
-        with f.open("r", encoding="ascii", errors="ignore") as fh:
-            for line in fh:
-                if "END OF HEADER" in line:
-                    break
-                if "APPROX POSITION XYZ" in line:
-                    x, y, z = float(line[0:14]), float(line[14:28]), float(line[28:42])
-                    if x == 0.0 and y == 0.0 and z == 0.0:
-                        return None
-                    lat, lon, _ = pymap3d.ecef2geodetic(x, y, z)
-                    return float(lat), float(lon)
-    except Exception:
-        pass
-    return None
-
-
 def collect_station_coords(obs_dir: Path) -> dict[str, tuple[float, float]]:
     all_files = [
         p for p in obs_dir.iterdir()
@@ -341,7 +159,7 @@ def collect_station_coords(obs_dir: Path) -> dict[str, tuple[float, float]]:
             pbar.update()
             if sta in seen:
                 continue
-            result = _read_coords(f)
+            result = read_rinex_coords(f)
             if result is None:
                 continue
             seen.add(sta)
@@ -377,24 +195,6 @@ def filter_stations_by_bbox(
             f"→ {len(inside)} remaining"
         )
     return inside
-
-
-def farthest_point_sample(
-    coords: dict[str, tuple[float, float]],
-    n: int,
-) -> dict[str, tuple[float, float]]:
-    if n <= 0 or n >= len(coords):
-        return coords
-    names = list(coords.keys())
-    pts   = np.array([coords[s] for s in names])
-    selected  = [0]
-    min_dists = np.full(len(pts), np.inf)
-    for _ in range(n - 1):
-        last      = pts[selected[-1]]
-        dists     = np.sqrt(((pts - last) ** 2).sum(axis=1))
-        min_dists = np.minimum(min_dists, dists)
-        selected.append(int(np.argmax(min_dists)))
-    return {names[i]: coords[names[i]] for i in selected}
 
 
 # ---------------------------------------------------------------------------
