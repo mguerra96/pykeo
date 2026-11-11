@@ -45,7 +45,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pykeo_lib.constants import CRX2RNX
 from pykeo_lib.download import _date_to_year_doy
 from pykeo_lib.pipeline import run
 from pykeo_lib.sources import obs_euref, obs_ingv, obs_local
@@ -54,11 +53,6 @@ from pykeo_lib.stations import ensure_station_networks, station_ids_from_network
 
 def _obs_source(source: str, work_dir: Path, local_dir: Path | None):
     """Return the get_obs(day, stations, obs_dir) function for --source (see pykeo_lib/sources.py)."""
-    if not CRX2RNX.exists():
-        logging.getLogger("orchestrator").warning(
-            "crx2rnx not found (PATH or project root): RINEX 2 Hatanaka (.yyD) files will be "
-            "skipped. RINEX 3 works without it. Install RNXCMP to read RINEX 2 Hatanaka."
-        )
     if source == "local":
         return partial(obs_local, src_dir=local_dir)
     if source == "ingv":
@@ -106,7 +100,7 @@ def _delete_obs_day(obs_dir: Path, target_date: date, logger: logging.Logger) ->
     """Delete all obs files for *target_date*, identified by year+DOY in their filename."""
     year, doy = _date_to_year_doy(target_date)
     year2 = year % 100
-    patterns = [f"*{year}{doy:03d}*", f"*{doy:03d}0.{year2:02d}[oOnN]"]
+    patterns = [f"*{year}{doy:03d}*", f"*{doy:03d}0.{year2:02d}*"]
     deleted = sum(
         1
         for pat in patterns

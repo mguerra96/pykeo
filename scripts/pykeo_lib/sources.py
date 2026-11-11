@@ -1,13 +1,14 @@
 """
 Observation sources: where the RINEX obs files for one day come from.
 
-The method (pipeline.run) only needs decompressed RINEX obs files on disk.
+The method (pipeline.run) only needs RINEX obs files on disk that pytecgg can
+read: plain, gzip (.gz) or Hatanaka (.crx / .yyD), but not Unix-compress (.Z).
 A source is any function with this signature:
 
     get_obs(day: date, stations: list[str] | None, obs_dir: Path) -> list[Path]
 
-It puts the obs files for `day` into `obs_dir` and returns their paths,
-decompressed (.rnx / .yyO), with standard RINEX 2 or 3 file names: the first
+It puts the obs files for `day` into `obs_dir` and returns their paths
+(decompress() in decompress.py unpacks .Z), with standard RINEX 2 or 3 file names: the first
 4 characters are the station ID, and the name holds the date ("2024172" in
 RINEX 3, "1720.24" in RINEX 2). `stations` limits the download to those IDs;
 None means every station the source has. Raise an exception when the source
@@ -26,12 +27,13 @@ Copy one of them to add your own data provider.
 
 import logging
 import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
 from .constants import FTP_HOST, GNSSGIVING_HOSTS
-from .decompress import can_decompress, decompress, expected_final_path
+from .decompress import decompress, expected_final_path
 from .download import (
     _date_to_year_doy,
     _download_parallel,
@@ -86,7 +88,7 @@ def obs_local(
     """
     Use obs files you already have in `src_dir` (one flat folder, any mix of
     RINEX 2/3, compressed .gz/.Z/Hatanaka or not). Matching files are copied
-    into obs_dir and decompressed there; `src_dir` is never modified.
+    into obs_dir (.Z files are unpacked there); `src_dir` is never modified.
     """
     year, doy = _date_to_year_doy(day)
     obs_dir.mkdir(parents=True, exist_ok=True)
@@ -98,8 +100,6 @@ def obs_local(
         if not f.is_file() or not any(t in f.name for t in tags):
             continue
         if stations_upper is not None and f.name[:4].upper() not in stations_upper:
-            continue
-        if not can_decompress(f.name):
             continue
         final = expected_final_path(f.name, obs_dir)
         if not final.exists():
@@ -164,6 +164,9 @@ def obs_ingv(
         f"{len(networks_to_query)} network(s) → {sorted(networks_to_query)}"
     )
 
+    claimed: set[str] = set()
+    claim_lock = threading.Lock()
+
     def _fetch_network(network: str, base_path: str, per_net_workers: int) -> list[Path]:
         remote_dir = f"{base_path}/{year}/{doy:03d}"
         logger.debug(f"[{network}] listing {remote_dir} (hosts: {GNSSGIVING_HOSTS})")
@@ -174,7 +177,12 @@ def obs_ingv(
             logger.warning(f"No data for {network} for DOY {doy:03d} ({day}).")
             return []
 
-        targets = _filter_obs_filenames(all_files, stations_upper)
+        # A station can be listed in several networks (which also covers networks that
+        # stopped publishing it); the first network to list a file claims it, so two
+        # networks never download the same file at once into the same path.
+        with claim_lock:
+            targets = [f for f in _filter_obs_filenames(all_files, stations_upper) if f not in claimed]
+            claimed.update(targets)
         if not targets:
             logger.debug(f"[{network}] No matching files for {day}.")
             return []

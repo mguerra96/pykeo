@@ -1,5 +1,5 @@
 # Python >= 3.11. Minimum versions = the ones this code was run with.
-pytecgg>=1.3.0
+pytecgg>=1.5.0   # reads .gz and Hatanaka RINEX itself
 polars>=1.39
 numpy>=2.3
 scipy>=1.17

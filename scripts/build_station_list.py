@@ -14,10 +14,8 @@ Networks
 --------
   All networks under gnssgiving.int.ingv.it /CONTINUOUS/30s/
 
-Decompression chain applied to every downloaded file:
-  .Z   → unlzw3 (LZW) or gzip if the file is mislabelled
-  .gz  → gzip (or Unix-compress if magic bytes are \x1f\x9d)
-  .crx / .??d → crx2rnx.exe (Hatanaka RINEX decompressor)
+Downloaded files are kept as .gz / Hatanaka (pytecgg reads them); only .Z
+files are unpacked (see pykeo_lib/decompress.py).
 
 Usage
 -----
@@ -28,11 +26,10 @@ python build_station_list.py --date 2015-06-21 --map-only
 
 Outputs
 -------
-  network/station_rnx/                        downloaded (decompressed) RINEX files
+  network/station_rnx/                        downloaded RINEX files
   network/station_map/stations_<year>.png     spatial coverage map
   network/station_lists/station_networks_<year>.json  station→network mapping
 
-Note: crx2rnx.exe must be present in the project root directory.
 """
 
 import argparse
@@ -50,7 +47,7 @@ from tqdm import tqdm
 
 from pykeo_lib.constants import GNSSGIVING_HOSTS
 from pykeo_lib.download import _download_one, _list_ftp_dir_failover
-from pykeo_lib.stations import farthest_point_sample, read_rinex_coords
+from pykeo_lib.stations import farthest_point_sample, is_obs_file, read_rinex_coords
 
 
 # ---------------------------------------------------------------------------
@@ -97,19 +94,6 @@ def _list_networks() -> list[str]:
     return files
 
 
-def _is_obs_file(fname: str) -> bool:
-    stem = fname
-    for ext in (".gz", ".Z"):
-        if stem.endswith(ext):
-            stem = stem[:-len(ext)]
-    inner_ext = Path(stem).suffix.lower()
-    if inner_ext in (".crx", ".rnx"):
-        return True
-    if len(inner_ext) == 4 and inner_ext[-1] in "od":
-        return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Per-network download
 # ---------------------------------------------------------------------------
@@ -120,7 +104,7 @@ def download_network(network: str, remote_dir: str, local_dir: Path, workers: in
     if files is None:
         # Fail loudly: a silently empty network would leave its stations out of the whole year.
         raise ConnectionError(f"{network}: no host reachable for {remote_dir}")
-    obs_files = [f for f in files if _is_obs_file(f)]
+    obs_files = [f for f in files if is_obs_file(f)]
     if not obs_files:
         return []
 
@@ -141,13 +125,7 @@ def download_network(network: str, remote_dir: str, local_dir: Path, workers: in
 # ---------------------------------------------------------------------------
 
 def collect_station_coords(obs_dir: Path) -> dict[str, tuple[float, float]]:
-    all_files = [
-        p for p in obs_dir.iterdir()
-        if p.is_file() and (
-            p.suffix.lower() == ".rnx"
-            or (len(p.suffix) == 4 and p.suffix[1:3].isdigit() and p.suffix[-1].lower() == "o")
-        )
-    ]
+    all_files = [p for p in obs_dir.iterdir() if p.is_file() and is_obs_file(p.name)]
 
     seen:   set[str]                       = set()
     coords: dict[str, tuple[float, float]] = {}

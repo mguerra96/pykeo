@@ -114,44 +114,10 @@ def _suppress_stderr():
         os.close(old_fd)
 
 
-def _strip_leap_seconds(p: Path) -> Path:
-    raw = p.read_bytes()
-    is_gz = raw[:2] == b"\x1f\x8b"
-    text = gzip.decompress(raw).decode("latin-1") if is_gz else raw.decode("latin-1")
-    cleaned = "\n".join(
-        line for line in text.splitlines()
-        if "LEAP SECONDS" not in line
-    ) + "\n"
-    data = gzip.compress(cleaned.encode("latin-1")) if is_gz else cleaned.encode("latin-1")
-    suffix = ".rnx.gz" if is_gz else ".rnx"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, mode="wb") as tmp:
-        tmp.write(data)
-        return Path(tmp.name)
-
-
 def _read_rinex_obs_safe(p: Path):
-    """Call read_rinex_obs, retrying once after stripping a malformed LEAP SECONDS header."""
-    try:
-        with _suppress_stderr():
-            return read_rinex_obs(str(p))
-    except BaseException as exc:
-        if type(exc).__name__ != "PanicException":
-            raise
-
-    tmp_path = _strip_leap_seconds(p)
-    try:
-        with _suppress_stderr():
-            result = read_rinex_obs(str(tmp_path))
-        logger.warning(f"{p.name}: malformed LEAP SECONDS header stripped and re-parsed successfully")
-        return result
-    except BaseException as exc2:
-        if type(exc2).__name__ != "PanicException":
-            raise
-        raise RuntimeError(
-            f"{p.name}: RINEX obs parser failed even after stripping LEAP SECONDS header"
-        ) from exc2
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    """Call read_rinex_obs with the Rust parser's stderr noise suppressed."""
+    with _suppress_stderr():
+        return read_rinex_obs(str(p))
 
 
 # Matches the epoch date field of a RINEX-3 NAV record:
@@ -192,9 +158,8 @@ def _read_rinex_nav_safe(p: Path):
     try:
         with _suppress_stderr():
             return read_rinex_nav(str(p))
-    except BaseException as exc:
-        if type(exc).__name__ != "PanicException":
-            raise
+    except OSError:
+        pass  # pytecgg >= 1.5 raises IOError (OSError) for a parser panic
 
     tmp_path = _fix_nav_day_zero(p)
     try:
@@ -202,11 +167,9 @@ def _read_rinex_nav_safe(p: Path):
             result = read_rinex_nav(str(tmp_path))
         logger.warning(f"{p.name}: fixed invalid 'day 00' NAV epochs and re-parsed successfully")
         return result
-    except BaseException as exc2:
-        if type(exc2).__name__ != "PanicException":
-            raise
+    except OSError as exc2:
         logger.warning(
-            f"{p.name}: RINEX nav parser still panicked after day-00 fix ({exc2}); skipping this NAV file"
+            f"{p.name}: RINEX nav parser still failed after day-00 fix ({exc2}); skipping this NAV file"
         )
         return None
     finally:
@@ -377,7 +340,7 @@ def run(
     """
     Run the TEC calibration method for one day.
 
-    obs_files: decompressed RINEX obs files for D-1, D and D+1 (see sources.py
+    obs_files: RINEX obs files (plain, .gz or Hatanaka) for D-1, D and D+1 (see sources.py
     for how to get them). Downloads NAV files from CDDIS/EUREF, calibrates all
     stations in parallel, and returns a merged DataFrame clipped to day D.
     Returns an empty DataFrame if no data could be obtained.

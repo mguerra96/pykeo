@@ -31,19 +31,9 @@ Python ≥ 3.11.
 pip install -r requirements.txt
 ```
 
-**pytecgg.** The minimum version is the current release. Recent fixes are on its
-`develop` branch until the next release; to use them (needs a Rust toolchain to build):
-
-```
-pip install git+https://github.com/viventriglia/PyTECGg.git@develop
-```
-
-**crx2rnx (optional).** Many archives distribute Hatanaka-compressed RINEX.
-pytecgg reads RINEX 3 Hatanaka (`.crx`) directly, but **RINEX 2 Hatanaka (`.yyD`)
-files need `crx2rnx`** from [RNXCMP](https://terras.gsi.go.jp/ja/crx2rnx.html).
-pykeo looks for `crx2rnx` on your `PATH`, then for `crx2rnx.exe` at the project root
-(a Windows build is included). Without it, RINEX 2 Hatanaka files are skipped with a
-warning. This matters mostly for older years: in 2015, about 80% of EUREF files are RINEX 2.
+**pytecgg ≥ 1.5.0** reads gzip (`.gz`) and Hatanaka (`.crx`, RINEX 2 `.yyD`) RINEX
+directly, so no external decompressor (crx2rnx) is needed. pykeo only unpacks
+Unix-compress (`.Z`) files, with `unlzw3`.
 
 ## Quick start
 
@@ -83,8 +73,8 @@ python scripts/orchestrator.py --year 2024 --source local --local-dir path/to/my
 - Files need standard RINEX names: the first 4 characters are the station ID, and the
   name contains the date (`2024172` in RINEX 3 long names, `1720.24` in RINEX 2 names).
 - The folder needs the days around the ones you process (D-1 and D+1).
-- Your folder is never modified: matching files are copied into `tec_data/obs/` and
-  decompressed there.
+- Your folder is never modified: matching files are copied into `tec_data/obs/`
+  (`.Z` files are unpacked there).
 
 ### Writing your own source
 
@@ -95,8 +85,8 @@ def get_obs(day: date, stations: list[str] | None, obs_dir: Path) -> list[Path]:
     ...
 ```
 
-It puts the obs files for `day` into `obs_dir` and returns their paths (decompressed,
-standard RINEX names). `stations` limits the download to those IDs; `None` means all.
+It puts the obs files for `day` into `obs_dir` and returns their paths (plain, `.gz` or
+Hatanaka, not `.Z`; standard RINEX names). `stations` limits the download to those IDs; `None` means all.
 Raise an exception when the server cannot be reached, so the day fails and is retried
 on the next run instead of being saved with missing stations; return `[]` when there is
 simply no data. Copy `obs_euref` (a single FTP folder per day) or `obs_ingv` (one folder

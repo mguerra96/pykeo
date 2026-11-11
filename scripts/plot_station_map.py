@@ -1,5 +1,5 @@
 """
-Plot a map of all stations found in a directory of decompressed RINEX obs files.
+Plot a map of all stations found in a directory of RINEX obs files.
 Works with any data source (e.g. the folder you pass to --source local).
 
 Usage
@@ -18,7 +18,7 @@ import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from pykeo_lib.stations import farthest_point_sample, read_rinex_coords
+from pykeo_lib.stations import farthest_point_sample, is_obs_file, read_rinex_coords
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,11 +35,7 @@ MARKER_COLOR     = "crimson"
 # ---------------------------------------------------------------------------
 
 def read_all_coords(obs_dir: Path, workers: int) -> dict[str, tuple[float, float]]:
-    files = [
-        f for f in obs_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in (".rnx", ".o")
-           or (f.is_file() and len(f.suffix) == 4 and f.suffix.lower().endswith("o"))
-    ]
+    files = [f for f in obs_dir.iterdir() if f.is_file() and is_obs_file(f.name)]
 
     coords: dict[str, tuple[float, float]] = {}
     seen: set[str] = set()
@@ -111,10 +107,10 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
 
     parser = argparse.ArgumentParser(
-        description="Plot a station map from decompressed RINEX obs files.",
+        description="Plot a station map from RINEX obs files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--obs-dir",    default="gnssgiving_obs", metavar="DIR",  help="Directory with decompressed RINEX files")
+    parser.add_argument("--obs-dir",    default="gnssgiving_obs", metavar="DIR",  help="Directory with RINEX obs files")
     parser.add_argument("--out",        default="gnssgiving_map.png",              help="Output PNG path")
     parser.add_argument("--workers",    type=int, default=DEFAULT_WORKERS,         help="Parallel header-reading threads")
     parser.add_argument("--n-stations", type=int, default=None,                    help="Select N stations by farthest-point sampling")

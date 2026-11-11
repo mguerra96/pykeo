@@ -1,139 +1,66 @@
-import gzip
-import io
-import logging
-import subprocess
-import zipfile
-from pathlib import Path
+"""
+Make a downloaded RINEX file readable by pytecgg.
 
-from .constants import CRX2RNX
+pytecgg (>= 1.5) reads plain, gzip (.gz) and Hatanaka (.crx, RINEX 2 .yyD)
+RINEX itself, so those are left as they are. Only Unix-compress (.Z) files and
+mislabelled .gz files (LZW or ZIP inside) are unpacked here.
+"""
+
+import gzip
+import logging
+import zipfile
+import io
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-
-def _is_hatanaka_rinex2(p: Path) -> bool:
-    return len(p.suffix) == 4 and p.suffix.upper().endswith("D")
+_GZIP_MAGIC = b"\x1f\x8b"
 
 
-def _is_hatanaka_rinex3(p: Path) -> bool:
-    return p.suffix.lower() == ".crx"
+def _unpack(raw: bytes) -> bytes:
+    """Decompress gzip, ZIP (first member) or Unix-compress bytes, by magic number."""
+    from unlzw3 import unlzw
 
-
-def can_decompress(fname: str) -> bool:
-    """False for RINEX 2 Hatanaka files when crx2rnx is missing: pytecgg cannot read those."""
-    return CRX2RNX.exists() or not _is_hatanaka_rinex2(Path(_uncompressed_name(fname)))
-
-
-def _uncompressed_name(fname: str) -> str:
-    for ext in (".Z", ".gz"):
-        if fname.endswith(ext):
-            fname = fname[: -len(ext)]
-    return fname
-
-
-def _run_crx2rnx(p: Path) -> Path | None:
-    if not CRX2RNX.exists():
-        if _is_hatanaka_rinex3(p):
-            return p  # pytecgg reads RINEX 3 Hatanaka directly (same data as crx2rnx output)
-        logger.warning(f"crx2rnx not found — cannot read RINEX 2 Hatanaka file {p.name}")
-        return None
-    try:
-        # Use DEVNULL rather than capture_output: capture_output opens OS pipes
-        # whose handles can be inherited by ProcessPoolExecutor worker spawns, so
-        # a timed-out crx2rnx leaves those pipes open in the workers and wedges
-        # the run at 0% CPU. DEVNULL has no pipe to leak, and
-        # CREATE_NEW_PROCESS_GROUP isolates the timeout-kill to crx2rnx alone.
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        subprocess.run(
-            [str(CRX2RNX), "-f", "-d", str(p)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=5,
-            creationflags=creationflags,
-        )
-        out = p.with_suffix(p.suffix[:-1] + "O") if _is_hatanaka_rinex2(p) else p.with_suffix(".rnx")
-        if out.exists():
-            p.unlink(missing_ok=True)
-            return out
-        logger.warning(f"crx2rnx produced no output for {p.name}")
-    except subprocess.TimeoutExpired:
-        logger.warning(f"crx2rnx timed out on {p.name} — skipping")
-        p.unlink(missing_ok=True)
-    except Exception as e:
-        logger.warning(f"crx2rnx error on {p.name}: {e}")
-    return None
+    if raw[:2] == _GZIP_MAGIC:
+        return gzip.decompress(raw)
+    if raw[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            if not names:
+                raise ValueError("empty ZIP")
+            return zf.read(names[0])
+    return unlzw(raw)
 
 
 def decompress(raw_path: Path) -> Path | None:
     """
-    Decompress a downloaded file through all needed steps:
-      .Z  → unlzw3 (or gzip if mislabelled)
-      .gz → gzip (or unlzw3 if mislabelled)
-      .??d / .crx (Hatanaka) → .??o / .rnx
-    Returns the final RINEX path, or None on failure.
+    Prepare a downloaded file for pytecgg and return its final path (see
+    expected_final_path), or None on failure:
+      .Z  → unpacked (LZW, or gzip/ZIP if mislabelled), .Z dropped from the name
+      .gz → kept; re-written as gzip if it holds LZW or ZIP
+      anything else (plain, .crx, .yyD) → kept as is
     """
-    from unlzw3 import unlzw
-
     p = raw_path
-
-    if p.suffix == ".Z":
-        out = p.with_suffix("")
-        raw = p.read_bytes()
-        if raw[:2] == b"\x1f\x8b":
-            try:
-                with gzip.open(io.BytesIO(raw), "rb") as fi:
-                    out.write_bytes(fi.read())
-                p.unlink(missing_ok=True)
-                p = out
-            except Exception as e:
-                logger.warning(f"gunzip(.Z) failed for {raw_path.name}: {e}")
-                return None
-        else:
-            try:
-                out.write_bytes(unlzw(raw))
-                p.unlink(missing_ok=True)
-                p = out
-            except Exception as e:
-                logger.warning(f"unlzw failed for {raw_path.name}: {e}")
-                return None
-
+    if p.suffix not in (".Z", ".gz"):
+        return p
+    raw = p.read_bytes()
+    if p.suffix == ".gz" and raw[:2] == _GZIP_MAGIC:
+        return p
+    try:
+        data = _unpack(raw)
+    except Exception as e:
+        logger.warning(f"decompress failed for {p.name}: {e}")
+        return None
     if p.suffix == ".gz":
-        out = p.with_suffix("")
-        raw = p.read_bytes()
-        try:
-            if raw[:2] == b"\x1f\x9d":
-                out.write_bytes(unlzw(raw))
-            elif raw[:2] == b"PK":
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    names = zf.namelist()
-                    if not names:
-                        logger.warning(f"empty ZIP for {raw_path.name}")
-                        return None
-                    out.write_bytes(zf.read(names[0]))
-            else:
-                with gzip.open(io.BytesIO(raw), "rb") as fi:
-                    out.write_bytes(fi.read())
-            p.unlink(missing_ok=True)
-            p = out
-        except Exception as e:
-            logger.warning(f"decompress failed for {raw_path.name}: {e}")
-            return None
-
-    if _is_hatanaka_rinex2(p) or _is_hatanaka_rinex3(p):
-        result = _run_crx2rnx(p)
-        if result is None:
-            return None
-        p = result
-
-    return p
+        # keep the .gz name so expected_final_path() still finds it on the next run
+        p.write_bytes(gzip.compress(data, compresslevel=1))
+        return p
+    out = p.with_suffix("")
+    out.write_bytes(data)
+    p.unlink(missing_ok=True)
+    return out
 
 
 def expected_final_path(fname: str, local_dir: Path) -> Path:
-    """Predict the final decompressed path for a filename before downloading."""
-    stem_path = local_dir / _uncompressed_name(fname)
-    if _is_hatanaka_rinex2(stem_path):
-        return stem_path.with_suffix(stem_path.suffix[:-1] + "O")
-    if _is_hatanaka_rinex3(stem_path) and CRX2RNX.exists():
-        return stem_path.with_suffix(".rnx")
-    return stem_path
+    """Predict decompress()'s output path for a filename before downloading."""
+    return local_dir / (fname[:-2] if fname.endswith(".Z") else fname)
