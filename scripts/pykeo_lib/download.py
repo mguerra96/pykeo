@@ -23,7 +23,7 @@ from .constants import (
     FTP_TIMEOUT_DOWNLOAD,
     FTP_TIMEOUT_LIST,
 )
-from .decompress import can_decompress, decompress, expected_final_path
+from .decompress import decompress, expected_final_path
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,6 @@ def _filter_obs_filenames(
         f for f in all_files
         if (f.endswith(".gz") or f.endswith(".Z"))
         and (stations_upper is None or f[:4].upper() in stations_upper)
-        and can_decompress(f)
     ]
 
 
@@ -161,8 +160,10 @@ def _get_local_nav_files(nav_dir: Path, year: int, doy: int) -> list[Path]:
     Sorted by source preference so the best multi-GNSS product is first.
     """
     yy = str(year)[-2:]
-    files = list(nav_dir.glob(f"*BRDC*{year}*{doy:03d}*"))
-    files.extend(nav_dir.glob(f"*BRDM*{year}*{doy:03d}*"))
+    # Anchor on the RINEX 3 "_YYYYDDD0000_" field: a looser "*{year}*{doy}*" also
+    # matches other days (DOY 160 matched ..._20242160000_... and ..._20240160000_...).
+    files = list(nav_dir.glob(f"*BRDC*_{year}{doy:03d}0000_*"))
+    files.extend(nav_dir.glob(f"*BRDM*_{year}{doy:03d}0000_*"))
     files.extend(nav_dir.glob(f"brdc{doy:03d}0.{yy}*"))
     # .part = unfinished download (see _download_nav_*), never read it
     return sorted({f for f in files if f.suffix != ".part"}, key=_nav_priority)

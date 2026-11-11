@@ -1,5 +1,4 @@
 import datetime as dt
-import shutil
 from pathlib import Path
 
 # EUREF EPN FTP
@@ -58,8 +57,3 @@ COLS_TO_KEEP = [
     "lat_ipp", "lon_ipp", "azi", "ele",
     "stec", "vtec", "vtec_detrended",
 ]
-
-# Hatanaka decompressor (RNXCMP crx2rnx): on PATH, else the copy at the project root.
-# Optional: pytecgg reads RINEX 3 .crx itself; only RINEX 2 Hatanaka (.yyD) files need it.
-_crx2rnx_on_path = shutil.which("crx2rnx") or shutil.which("CRX2RNX")
-CRX2RNX = Path(_crx2rnx_on_path) if _crx2rnx_on_path else Path(__file__).parent.parent.parent / "crx2rnx.exe"

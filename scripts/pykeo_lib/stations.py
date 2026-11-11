@@ -7,6 +7,7 @@ If the JSON is missing entirely, invokes build_station_list.py as a
 subprocess to create it automatically.
 """
 
+import gzip
 import json
 import logging
 import subprocess
@@ -106,12 +107,21 @@ def station_ids_from_networks(mapping: dict[str, str]) -> list[str]:
     return sorted(mapping.keys())
 
 
+def is_obs_file(fname: str) -> bool:
+    """True for a RINEX obs file name: .rnx/.crx or RINEX 2 .yyO/.yyD, optionally .gz/.Z."""
+    stem = fname.removesuffix(".gz").removesuffix(".Z")
+    inner_ext = Path(stem).suffix.lower()
+    return inner_ext in (".crx", ".rnx") or (len(inner_ext) == 4 and inner_ext[-1] in "od")
+
+
 def read_rinex_coords(f: Path) -> tuple[float, float] | None:
-    """Return (lat, lon) from a RINEX obs header's APPROX POSITION XYZ, or None."""
+    """Return (lat, lon) from a RINEX obs header's APPROX POSITION XYZ, or None.
+    Works on Hatanaka files too: their header is plain RINEX after two CRINEX lines."""
     import pymap3d
 
+    opener = gzip.open if f.suffix == ".gz" else open
     try:
-        with f.open("r", encoding="ascii", errors="ignore") as fh:
+        with opener(f, "rt", encoding="ascii", errors="ignore") as fh:
             for line in fh:
                 if "END OF HEADER" in line:
                     break

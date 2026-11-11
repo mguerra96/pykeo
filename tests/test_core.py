@@ -9,8 +9,10 @@ station grouping, jump levelling. No network, no sample data.
 import datetime as dt
 import ftplib
 import gzip
+import io
 import socket
 import sys
+import zipfile
 from pathlib import Path
 
 import polars as pl
@@ -22,6 +24,7 @@ from pykeo_lib import decompress as dc
 from pykeo_lib import download as dl
 from pykeo_lib.pipeline import _fix_nav_day_zero, _group_obs_by_station, _level_vtec_jumps
 from pykeo_lib.sources import obs_local
+from pykeo_lib.stations import is_obs_file, read_rinex_coords
 
 R3 = "AQUI00ITA_R_20241720000_01D_30S_MO.crx.gz"   # RINEX 3 Hatanaka
 R2 = "ACOR1720.15D.Z"                               # RINEX 2 Hatanaka
@@ -58,35 +61,44 @@ def test_fix_nav_day_zero_rolls_back_to_previous_day(tmp_path, gz):
 # File naming: must match what decompress() produces, or every run re-downloads
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def with_crx2rnx(monkeypatch, tmp_path):
-    fake = tmp_path / "crx2rnx.exe"
-    fake.touch()
-    monkeypatch.setattr(dc, "CRX2RNX", fake)
+def test_names_keep_gz_and_hatanaka(tmp_path):
+    # pytecgg reads .gz and Hatanaka itself; only .Z is unpacked
+    assert dc.expected_final_path(R3, tmp_path).name == R3
+    assert dc.expected_final_path(R2, tmp_path).name == "ACOR1720.15D"
+    assert dc.expected_final_path(PLAIN, tmp_path).name == PLAIN
+    assert dl._filter_obs_filenames([R3, R2, PLAIN, "x.txt"], None) == [R3, R2, PLAIN]
 
 
-@pytest.fixture
-def without_crx2rnx(monkeypatch):
-    monkeypatch.setattr(dc, "CRX2RNX", Path("no_such_crx2rnx"))
+def test_decompress_matches_expected_name(tmp_path):
+    real_gz = tmp_path / R3
+    real_gz.write_bytes(gzip.compress(b"crinex"))
+    assert dc.decompress(real_gz) == dc.expected_final_path(R3, tmp_path)
+    assert gzip.decompress(real_gz.read_bytes()) == b"crinex"   # left untouched
+
+    z_holding_gzip = tmp_path / R2   # mislabelled .Z
+    z_holding_gzip.write_bytes(gzip.compress(b"hatanaka"))
+    out = dc.decompress(z_holding_gzip)
+    assert out == dc.expected_final_path(R2, tmp_path) and out.read_bytes() == b"hatanaka"
+    assert not z_holding_gzip.exists()
+
+    gz_holding_zip = tmp_path / PLAIN   # mislabelled .gz: re-written as real gzip, same name
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inner", b"obs")
+    gz_holding_zip.write_bytes(buf.getvalue())
+    out = dc.decompress(gz_holding_zip)
+    assert out == dc.expected_final_path(PLAIN, tmp_path)
+    assert gzip.decompress(out.read_bytes()) == b"obs"
 
 
-def test_names_with_crx2rnx(with_crx2rnx, tmp_path):
-    assert dc.expected_final_path(R3, tmp_path).name == "AQUI00ITA_R_20241720000_01D_30S_MO.rnx"
-    assert dc.expected_final_path(R2, tmp_path).name == "ACOR1720.15O"
-    assert dc.expected_final_path(PLAIN, tmp_path).name == "abcd1720.24o"
-    assert all(dc.can_decompress(n) for n in (R3, R2, PLAIN))
-
-
-def test_names_without_crx2rnx(without_crx2rnx, tmp_path):
-    # RINEX 3 Hatanaka is kept as .crx (pytecgg reads it); RINEX 2 Hatanaka is skipped.
-    assert dc.expected_final_path(R3, tmp_path).name == "AQUI00ITA_R_20241720000_01D_30S_MO.crx"
-    assert dc.can_decompress(R3) and dc.can_decompress(PLAIN)
-    assert not dc.can_decompress(R2)
-    assert R2 not in dl._filter_obs_filenames([R3, R2, PLAIN], None)
-
+def test_read_rinex_coords_reads_gzip(tmp_path):
+    xyz = f"{4642432.6:14.4f}{1028629.0:14.4f}{4246494.8:14.4f}"
+    header = f"{xyz:<60}APPROX POSITION XYZ\n{'':60}END OF HEADER\n"
     f = tmp_path / R3
-    f.write_bytes(gzip.compress(b"crinex"))
-    assert dc.decompress(f) == dc.expected_final_path(R3, tmp_path)
+    f.write_bytes(gzip.compress(header.encode()))
+    lat, lon = read_rinex_coords(f)
+    assert lat == pytest.approx(42.0, abs=0.5) and lon == pytest.approx(12.5, abs=0.5)
+    assert is_obs_file(R3) and is_obs_file(R2) and is_obs_file(PLAIN) and not is_obs_file("nav.json")
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +201,28 @@ def test_obs_local_copies_and_never_modifies_source(tmp_path):
 
     got = obs_local(dt.date(2024, 6, 20), None, obs, src_dir=src)
 
-    assert sorted(p.name for p in got) == ["ABCD00ITA_R_20241720000_01D_30S_MO.rnx", "efgh1720.24o"]
+    assert sorted(p.name for p in got) == ["ABCD00ITA_R_20241720000_01D_30S_MO.rnx", "efgh1720.24o.gz"]
     assert all(p.parent == obs for p in got)
     assert sorted((f.name, f.read_bytes()) for f in src.iterdir()) == before
-    assert [p.name for p in obs_local(dt.date(2024, 6, 20), ["EFGH"], obs, src_dir=src)] == ["efgh1720.24o"]
+    assert [p.name for p in obs_local(dt.date(2024, 6, 20), ["EFGH"], obs, src_dir=src)] == ["efgh1720.24o.gz"]
+
+
+# ---------------------------------------------------------------------------
+# INGV source: a file listed in two networks is downloaded once, and a station
+# whose own network is empty is still found in another
+# ---------------------------------------------------------------------------
+
+def test_obs_ingv_downloads_each_file_once(monkeypatch, tmp_path):
+    import pykeo_lib.sources as src
+
+    asir, geno = "ASIR00ITA_R_20260210000_01D_30S_MO.crx.gz", "GENO00ITA_R_20260210000_01D_30S_MO.crx.gz"
+    listings = {"EUREF": [asir, geno], "NETB": [asir, geno], "EMPTY": []}
+    monkeypatch.setattr(src, "load_station_networks",
+                        lambda *a, **k: {"ASIR": "EUREF", "GENO": "NETB", "DUNG": "EMPTY"})
+    monkeypatch.setattr(src, "_list_ftp_dir_failover", lambda hosts, d: (listings[d.split("/")[3]], "h"))
+    got = []
+    monkeypatch.setattr(src, "_download_parallel", lambda targets, *a: got.extend(targets) or [])
+
+    src.obs_ingv(dt.date(2026, 1, 21), ["ASIR", "GENO", "DUNG"], tmp_path, work_dir=tmp_path)
+
+    assert sorted(got) == [asir, geno]
